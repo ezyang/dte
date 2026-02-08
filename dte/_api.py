@@ -1,5 +1,7 @@
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
+from torch.distributed._local_tensor import LocalTensor, local_tensor_mode
 
 """
 
@@ -610,19 +612,26 @@ sharding.  However, most people find the JAX-style tensor dim more intuitive
 to work with, and it is quite beneficial to be able to factor the global SPMD
 into a local SPMD type plus something extra!)
 
-TODO: this is NOT actually true, the local SPMD types are different
-
 We continue to do local SPMD type checking as described above.  Our new
-problem is to describe the type propagation rules for the partition spec.
+problem is to describe the shard propagation rules for the partition spec.
 Unfortunately, unlike in local SPMD, this must be done on a per operator basis
 (for both non-comms and comms operators).
 
 Local SPMD and global SPMD can seamlessly interoperate with each other.  If you
 enter a local map (aka `shard_map`) region, you simply forget the partition spec;
 when you want to reenter global SPMD, you simply have to specify how the tensor
-should be reassembled into a full tensor.
+should be reassembled into a full tensor.  Additionally, one of our design
+goals is you can simply forget the partition spec, decaying a global SPMD type
+into a local SPMD type, and still have a well-typed program.  One consequence
+of this is, unlike DTensor, classic operations like sum() and matmul() will not
+automatically work in cases where an operation can be done completely locally
+except for a pending reduction.
+
 
 ## Shard propagation
+
+We can think of PartitionSpec as a function which takes a full tensor to a
+
 
 TODO: Design problem: should contraction on sharded dimension automatically produce
 partial, or should you be forced to spell it out explicitly?
@@ -646,7 +655,15 @@ out2: Partial = reinterpret(out: Varying, to='partial')
 If you only run a linear in local SPMD, you have asked to perform only a local
 matrix multiply per rank; the local semantics of a matmul do NOT imply a global
 reduction over all ranks.  The reinterpret is necessary to indicate, "Actually, I do
-want a global matmul!"  In global SPMD, we would instead error on the linear call.
+want a global matmul!"
+
+In global SPMD, we would instead error on the linear call,
+as this operation when  TODO: I... don't think so?
+
+Conflicting properties:
+
+1. Global SPMD decays to local spmd with no changes
+2. You get to use conventional matmul/sum and automatically get partials
 
 TODO: Write the rest
 
@@ -848,13 +865,13 @@ class _AllReduceToReplicate(torch.autograd.Function):
     def forward(ctx, x, axis_name):
         ctx.axis_name = axis_name
         pg = _get_mesh_axis_group(axis_name)
-        return dist.all_reduce(x, op=dist.ReduceOp.SUM, group=pg, async_op=False)
+        return funcol.all_reduce(x, "sum", pg).wait()
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward of P -> R is P -> R (same operation)
         pg = _get_mesh_axis_group(ctx.axis_name)
-        return dist.all_reduce(grad_out, op=dist.ReduceOp.SUM, group=pg, async_op=False), None
+        return funcol.all_reduce(grad_out, "sum", pg).wait(), None
 
 
 class _AllReduceToInvariant(torch.autograd.Function):
@@ -864,7 +881,7 @@ class _AllReduceToInvariant(torch.autograd.Function):
     def forward(ctx, x, axis_name):
         ctx.axis_name = axis_name
         pg = _get_mesh_axis_group(axis_name)
-        return dist.all_reduce(x, op=dist.ReduceOp.SUM, group=pg, async_op=False)
+        return funcol.all_reduce(x, "sum", pg).wait()
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -997,21 +1014,14 @@ class _ReduceScatter(torch.autograd.Function):
         ctx.axis_name = axis_name
         ctx.scatter_dim = scatter_dim
         pg = _get_mesh_axis_group(axis_name)
-        world_size = dist.get_world_size(pg)
-        # Split input and reduce-scatter
-        chunks = list(torch.chunk(x, world_size, dim=scatter_dim))
-        output = torch.empty_like(chunks[0])
-        dist.reduce_scatter(output, chunks, op=dist.ReduceOp.SUM, group=pg)
-        return output
+        # Use functional reduce_scatter_tensor which works with LocalTensorMode
+        return funcol.reduce_scatter_tensor(x, "sum", scatter_dim, pg).wait()
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(R): V -> R
         pg = _get_mesh_axis_group(ctx.axis_name)
-        world_size = dist.get_world_size(pg)
-        gathered = [torch.empty_like(grad_out) for _ in range(world_size)]
-        dist.all_gather(gathered, grad_out, group=pg)
-        return torch.cat(gathered, dim=ctx.scatter_dim), None, None
+        return funcol.all_gather_tensor(grad_out, ctx.scatter_dim, pg).wait(), None, None
 
 
 def reduce_scatter(x, axis_name, *, scatter_dim: int = 0):
@@ -1112,11 +1122,13 @@ class _ReplicateToInvariant(torch.autograd.Function):
         # backward is convert(I,P): I -> P
         # Zero out all but rank 0
         pg = _get_mesh_axis_group(ctx.axis_name)
-        rank = dist.get_rank(pg)
-        if rank == 0:
-            return grad_out, None
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(grad_out, LocalTensor):
+            return mode.tensor_map(grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)), None
         else:
-            return torch.zeros_like(grad_out), None
+            rank = dist.get_rank(pg)
+            return _replicate_to_partial_fwd(grad_out, rank), None
 
 
 class _InvariantToReplicate(torch.autograd.Function):
@@ -1223,6 +1235,42 @@ pcast = reinterpret
 # =============================================================================
 
 
+def _get_rank(pg):
+    """Get rank, using LocalTensorMode's simulated rank if available."""
+    mode = local_tensor_mode()
+    if mode is not None:
+        # We're in LocalTensorMode - rank will be set by tensor_map callback
+        # This function shouldn't be called directly in that case
+        return dist.get_rank(pg)
+    return dist.get_rank(pg)
+
+
+def _replicate_to_varying_fwd(x, world_size, split_dim, rank):
+    """Forward: split and take local portion based on rank."""
+    chunks = torch.chunk(x, world_size, dim=split_dim)
+    return chunks[rank].contiguous()
+
+
+def _varying_to_partial_fwd(x, world_size, split_dim, rank):
+    """Forward: pad with zeros, place data at rank position."""
+    pad_shape = list(x.shape)
+    pad_shape[split_dim] = pad_shape[split_dim] * world_size
+    result = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
+    chunk_size = x.shape[split_dim]
+    slices = [slice(None)] * len(pad_shape)
+    slices[split_dim] = slice(rank * chunk_size, (rank + 1) * chunk_size)
+    result[tuple(slices)] = x
+    return result
+
+
+def _replicate_to_partial_fwd(x, rank):
+    """Forward: keep value on rank 0, zero elsewhere."""
+    if rank == 0:
+        return x.clone()
+    else:
+        return torch.zeros_like(x)
+
+
 class _ConvertReplicateToVarying(torch.autograd.Function):
     """convert(R,V): R -> V, backward is convert(V,P): V -> P."""
 
@@ -1232,28 +1280,33 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
         ctx.split_dim = split_dim
         pg = _get_mesh_axis_group(axis_name)
         world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        # Split and take local portion
-        chunks = torch.chunk(x, world_size, dim=split_dim)
-        return chunks[rank].contiguous()
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(x, LocalTensor):
+            return mode.tensor_map(
+                x,
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r)
+            )
+        else:
+            rank = dist.get_rank(pg)
+            return _replicate_to_varying_fwd(x, world_size, split_dim, rank)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(V,P): V -> P
-        # Pad with zeros in other positions
         pg = _get_mesh_axis_group(ctx.axis_name)
         world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        # Create padded output
-        pad_shape = list(grad_out.shape)
-        pad_shape[ctx.split_dim] = pad_shape[ctx.split_dim] * world_size
-        result = torch.zeros(pad_shape, dtype=grad_out.dtype, device=grad_out.device)
-        # Place grad_out in the correct position
-        chunk_size = grad_out.shape[ctx.split_dim]
-        slices = [slice(None)] * len(pad_shape)
-        slices[ctx.split_dim] = slice(rank * chunk_size, (rank + 1) * chunk_size)
-        result[tuple(slices)] = grad_out
-        return result, None, None
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(grad_out, LocalTensor):
+            result = mode.tensor_map(
+                grad_out,
+                lambda r, t: _varying_to_partial_fwd(t, world_size, ctx.split_dim, r)
+            )
+            return result, None, None
+        else:
+            rank = dist.get_rank(pg)
+            return _varying_to_partial_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
 
 
 class _ConvertInvariantToVarying(torch.autograd.Function):
@@ -1265,10 +1318,16 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
         ctx.split_dim = split_dim
         pg = _get_mesh_axis_group(axis_name)
         world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        # Split and take local portion
-        chunks = torch.chunk(x, world_size, dim=split_dim)
-        return chunks[rank].contiguous()
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(x, LocalTensor):
+            return mode.tensor_map(
+                x,
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, split_dim, r)
+            )
+        else:
+            rank = dist.get_rank(pg)
+            return _replicate_to_varying_fwd(x, world_size, split_dim, rank)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -1287,22 +1346,25 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
     def forward(ctx, x, axis_name):
         ctx.axis_name = axis_name
         pg = _get_mesh_axis_group(axis_name)
-        rank = dist.get_rank(pg)
-        # Zero out all but rank 0
-        if rank == 0:
-            return x
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(x, LocalTensor):
+            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
-            return torch.zeros_like(x)
+            rank = dist.get_rank(pg)
+            return _replicate_to_partial_fwd(x, rank)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is same operation: convert(R,P)
         pg = _get_mesh_axis_group(ctx.axis_name)
-        rank = dist.get_rank(pg)
-        if rank == 0:
-            return grad_out, None
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(grad_out, LocalTensor):
+            return mode.tensor_map(grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)), None
         else:
-            return torch.zeros_like(grad_out), None
+            rank = dist.get_rank(pg)
+            return _replicate_to_partial_fwd(grad_out, rank), None
 
 
 class _ConvertInvariantToPartial(torch.autograd.Function):
@@ -1312,12 +1374,13 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
     def forward(ctx, x, axis_name):
         ctx.axis_name = axis_name
         pg = _get_mesh_axis_group(axis_name)
-        rank = dist.get_rank(pg)
-        # Zero out all but rank 0
-        if rank == 0:
-            return x
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(x, LocalTensor):
+            return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
-            return torch.zeros_like(x)
+            rank = dist.get_rank(pg)
+            return _replicate_to_partial_fwd(x, rank)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -1334,25 +1397,33 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         ctx.split_dim = split_dim
         pg = _get_mesh_axis_group(axis_name)
         world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        # Pad with zeros: local data goes in position [rank]
-        pad_shape = list(x.shape)
-        pad_shape[split_dim] = pad_shape[split_dim] * world_size
-        result = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
-        chunk_size = x.shape[split_dim]
-        slices = [slice(None)] * len(pad_shape)
-        slices[split_dim] = slice(rank * chunk_size, (rank + 1) * chunk_size)
-        result[tuple(slices)] = x
-        return result
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(x, LocalTensor):
+            return mode.tensor_map(
+                x,
+                lambda r, t: _varying_to_partial_fwd(t, world_size, split_dim, r)
+            )
+        else:
+            rank = dist.get_rank(pg)
+            return _varying_to_partial_fwd(x, world_size, split_dim, rank)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(R,V): R -> V (take local slice)
         pg = _get_mesh_axis_group(ctx.axis_name)
         world_size = dist.get_world_size(pg)
-        rank = dist.get_rank(pg)
-        chunks = torch.chunk(grad_out, world_size, dim=ctx.split_dim)
-        return chunks[rank].contiguous(), None, None
+
+        mode = local_tensor_mode()
+        if mode is not None and isinstance(grad_out, LocalTensor):
+            result = mode.tensor_map(
+                grad_out,
+                lambda r, t: _replicate_to_varying_fwd(t, world_size, ctx.split_dim, r)
+            )
+            return result, None, None
+        else:
+            rank = dist.get_rank(pg)
+            return _replicate_to_varying_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
 
 
 def convert(x, axis_name, *, src: str, tgt: str, dim: int = 0):
