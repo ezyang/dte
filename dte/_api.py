@@ -225,7 +225,7 @@ When `dst='invariant'`, aka `all_gather(I): V -> I`, the backwards is `convert(I
 [C]
 ```
 
-### `all_reduce(x: Varying | Partial, mesh_axis, src, tgt) -> Replicate | Invariant`
+### `all_reduce(x: Partial, mesh_axis, src, tgt) -> Replicate | Invariant`
 
 Reduce shards along the mesh axis, so that every rank has the full summed value.
 
@@ -251,29 +251,10 @@ When `tgt='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpr
 [A]  <=  [A]
 ```
 
-For varying input, the forwards is:
+It is common to want to `all_reduce` on varying data; just `pinterpret(V,P)` the data
+as partial before calling `all_reduce`.
 
-```
-[A0]
-[A1]  =>  [A0 + A1 + A2]
-[A2]
-```
-
-When `tgt='replicate'`, aka `all_reduce(R): P -> R`, the backwards is `all_reduce(R): P -> R`
-
-```
-                    +[A0]
-[A0 + A1 + A2]  <=  +[A1]
-                    +[A2]
-```
-
-When `tgt='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpret(I,R): I -> R`
-
-```
-[A]  <=  [A]
-```
-
-TODO: I think you don't actually have to pass src here
+TODO: I think with erasure we can infer this cast
 
 ### `reduce_scatter(x, mesh_axis): Varying | Partial -> Varying`
 
@@ -404,7 +385,7 @@ Backward:
 
 TODO[claude]: Do these compositions below directly, like the ones above
 
-`R -> P`, is the composition of `R -> V -> P`.  `I -> P`, is the composition
+`reinterpret(R,P): R -> P`, is the composition of `R -> V -> P`.  `reinterpret(I,P): I -> P`, is the composition
 of `I -> V -> P`.  Note that this reinterpret has unusual semantics: the
 resulting tensor has been scaled by the mesh axis size (because you are now
 obligated to sum each of the (equal) quantities of the rank together!) If you
@@ -554,33 +535,18 @@ R -> V      reinterpret(R,V)        V -> P      reinterpret(V,P)
 R -> P      reinterpret(R,P)        R -> P      reinterpret(R,P)
             convert(R,P)                        convert(R,P)
 I -> R      reinterpret(I,R)        P -> I      all_reduce(I)
-I -> V      reinterpret(I,V)        V -> I      all_reduce(I)
+I -> V      reinterpret(I,V)        V -> I      all_reduce(I) . reinterpret(V,P)
             convert(I,V)                        all_gather(I)
-I -> P      reinterpret(I,P)        R -> I      pcast(R,I)
-            convert(I,P)
+I -> P      reinterpret(I,P)        R -> I      all_reduce(I) . reinterpret(R,P)
+            convert(I,P)                        reinterpret(R,I)
 V -> R      all_gather(R)           P -> V      reduce_scatter()
-V -> I      all_gather(I)           I -> V      pscatter()
+V -> I      all_gather(I)           I -> V      convert(I,V)
 V -> V      all_to_all()            V -> V      all_to_all()
-V -> P      reinterpret(V,P)        R -> V      pcast(R,V)
-            convert(V,P)
+V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
+            convert(V,P)                        convert(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
-P -> I      all_reduce(I)           I -> R      pcast(I,R)
+P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
-
-## Some more exotic functions
-
-```
-               [A]
-[A, B, C]  =>  [B]
-               [C]
-
-def local_shard(tensor: R, mesh_axis) -> V:
-    return tensor.split(mesh.size(mesh_axis))[mesh.get_local_rank(mesh_axis)]
-```
-
-And the backward:
-
-```
 
 # Global SPMD
 
@@ -601,6 +567,8 @@ If you only run a linear in local SPMD, you have asked to perform only a local
 matrix multiply per rank; the local semantics of a matmul do NOT imply a global
 reduction over all ranks.  The pcast is necessary to indicate, "Actually, I do
 want a global matmul!"  In global SPMD, we would instead error on the linear call.
+
+TODO: Write the rest
 
 TODO from YZ: in global spmd, can represent partial as an extra dimension, hidden with vmap
 
