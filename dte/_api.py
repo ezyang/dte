@@ -609,35 +609,100 @@ partition spec.
 (Aside: another way we could have defined the global SPMD type is by replacing
 Varying with Shard(tensor dim), which is indeed how PyTorch DTensor defines
 sharding.  However, most people find the JAX-style tensor dim more intuitive
-to work with, and it is quite beneficial to be able to factor the global SPMD
+to work with, and it is nice to be able to factor the global SPMD type
 into a local SPMD type plus something extra!)
 
 We continue to do local SPMD type checking as described above.  Our new
-problem is to describe the shard propagation rules for the partition spec.
+problem is to describe the shard propagation rules for partition spec.
 Unfortunately, unlike in local SPMD, this must be done on a per operator basis
 (for both non-comms and comms operators).
 
-Local SPMD and global SPMD can seamlessly interoperate with each other.  If you
-enter a local map (aka `shard_map`) region, you simply forget the partition spec;
-when you want to reenter global SPMD, you simply have to specify how the tensor
-should be reassembled into a full tensor.  Additionally, one of our design
-goals is you can simply forget the partition spec, decaying a global SPMD type
-into a local SPMD type, and still have a well-typed program.  One consequence
-of this is, unlike DTensor, classic operations like sum() and matmul() will not
-automatically work in cases where an operation can be done completely locally
-except for a pending reduction.
+Local SPMD and global SPMD can seamlessly interoperate with each other.  If
+you enter a local map (aka `shard_map`) region, you simply forget the
+partition spec; when you want to reenter global SPMD, you simply have to
+specify how the tensor should be reassembled into a full tensor.  We make the
+following choices for how local and global SPMD types can interact:
+
+1. Switching between local and global SPMD is done via a higher order function
+   like `local_map` or `shard_map` (as opposed to having two kinds of tensor that
+   propagate through the program, ala `from_local` and `to_local`).  Either mode
+   of operation can be supported, but we think it is easier to reason about
+   global versus local SPMD over an entire scope, rather than having to reason
+   about whether or not a particular tensor is global or local SPMD on a
+   fine-grained
+   basis.
+
+2. Global versus local SPMD semantics are done on a per mesh axis basis
+   (similar to JAX).  So you can switch to local SPMD semantics for only one mesh
+   axis (e.g., the EP axis) while staying in global SPMD for another (e.g., the
+   EP_TP axis.)
+
+One of our design goals is you can simply forget the partition spec, decaying
+a global SPMD type into a local SPMD type, and still have a well-typed
+program.  One consequence of this is, unlike DTensor, classic operations like
+sum(), matmul() and einsum() will not automatically work in cases where an
+operation can be done completely locally except for a pending reduction.
 
 
 ## Shard propagation
 
-We can think of PartitionSpec as a function which takes a full tensor to a
+We can think of partition spec as a function which takes a full tensor to a
+mesh of sharded tensors.  The question of shard propagation is, given an input
+PartitionSpec `in_spec`, does there exist an output PartitionSpec `out_spec`
+such that this equality holds:
 
+```
+map(f, in_spec(x)) == out_spec(f(x))
+```
 
-TODO: Design problem: should contraction on sharded dimension automatically produce
-partial, or should you be forced to spell it out explicitly?
+A classic shard propagation rule is the one for `einsum`.  The following conditions
+must hold:
 
+1. No contracted dimension is sharded (but see the following discussion).
+2. For each mesh axis, if an output label is sharded on that mesh axis, then every
+   operand either uses the label and is sharded on that axis, or doesn't use that
+   label and is not sharded on that axis.
+3. No repeated mesh axes are allowed on an array's spec.
 
-## Worked example comparing local SPMD and global SPMD
+When these conditions succeed, at runtime we can simply run einsum as we would
+have run it in local SPMD, and know that there is an appropriate
+interpretation of the output where we computed the global SPMD semantics.
+When sharding propagation errors, it means that the global SPMD semantics and
+local SPMD semantics align, and comms are needed to ensure we actually compute
+global SPMD semantics.
+
+Let's talk about local operators that can produce partial.  When a contracted
+dimension is sharded, we can in principle do the operation entirely locally by
+declaring that there is a pending reduction.  This is PyTorch DTensor's
+behavior by default; it will transparently generate partial reductions from
+ordinary operations when warranted.  However, we find this problematic for two
+reasons:
+
+1. First, implicitly converting the varying output to partial, when necessary
+   to have correct global SPMD semantics, would mean that behavior in local
+   SPMD and global SPMD regions differ.  This is doable; we simply need to
+   know if we are global SPMD or local SPMD at runtime, but it is aesthetically
+   displeasing because, for the most part, global SPMD is just a strict
+   subset of local SPMD operations.
+
+2. Second, in discussions with people who have traditionally programmed in local
+   SPMD (that's most people in PyTorch!) and then have tried out global SPMD
+   via DTensor, they have generally found that understanding when partial pops
+   up and how it propagates to be quite confusing.  Usually, the story goes that
+   they just wrote some code, and then they're debugging why extra collectives
+   have occurred, and they only then realize that there are some partial tensors
+   floating around.
+
+So we take a different approach: you must explicitly specify when you want an
+partial output on these operators.  Because this ambiguity only arises for
+partial outputs, we expose this as simply as a new keyword argument
+`out_partial_axes` which is a set of device mesh axes to be partial on.  In
+local SPMD, the semantics of this argument is to do the local operation and
+then `reinterpret` the result as partial on each of the out partial axes.
+However, this must be done all in one step in global SPMD, since the
+intermediate local operation without reinterprets is not valid in global SPMD.
+
+### Worked example comparing local SPMD and global SPMD
 
 An illustrative example highlighting the difference between local and global
 SPMD is what happens when we perform the matmul in row-parallel linear
@@ -657,19 +722,65 @@ matrix multiply per rank; the local semantics of a matmul do NOT imply a global
 reduction over all ranks.  The reinterpret is necessary to indicate, "Actually, I do
 want a global matmul!"
 
-In global SPMD, we would instead error on the linear call,
-as this operation when  TODO: I... don't think so?
+In global SPMD, we would instead error on the linear call.  Instead, you would write:
 
-Conflicting properties:
+```
+out2 = linear(hidden, weight, out_partial_axes='tp')
+```
 
-1. Global SPMD decays to local spmd with no changes
-2. You get to use conventional matmul/sum and automatically get partials
+### Shard propagation for comms operators
 
-TODO: Write the rest
+All local SPMD comms operators are also valid in global SPMD.  We simply need to describe
+how they propagate sharding.  Intuitively, all of these comms operators simply replace
+Varying with Shard(0) (you can translate this into partition spec form using the standard
+device mesh dim to tensor dim translation).  Here are all of the affected operators:
 
-TODO from YZ: in global spmd, can represent partial as an extra dimension, hidden with vmap
+```
+all_gather(R): Shard(0) -> Replicate
+all_gather(I): Shard(0) -> Invariant
+reduce_scatter: Partial -> Shard(0)
+all_to_all: Shard(0) -> Shard(0)
+reinterpret(R,V): Replicate -> Shard(0)
+reinterpret(V,P): Shard(0) -> Partial
+convert(R,V): Replicate -> Shard(0)
+convert(I,V): Replicate -> Shard(0)
+convert(V,P): Replicate -> Shard(0)
+```
+
+Do we have to only accept sharding on tensor dim 0?  Many collectives take an
+argument saying which tensor dim to operate on (e.g., an all-gather on tensor
+dim 1 instead of tensor dim 0); in which case the tensor dim Shard references
+changes accordingly.
+
+TODO: reinterpret can probably usefully take a tensor dim argument
+
+The global SPMD interpretation of convert is straightforward: it is the identity function.
+However, the global SPMD interpretations of reinterpret are sometimes counter-intuitive.
+Here, we write "single device" versions of these functions to make it clear what their
+action is, given sharding on tensor dim 0:
+
+```
+def reinterpret_R_I(x):
+    return x
+
+def reinterpret_R_S0(x):
+    repeats = [mesh_axis_size] + [1] * (x.ndim - 1)
+    return x.repeat(repeats)
+
+def reinterpret_I_R(x):
+    return x
+
+def reinterpret_S0_P(x):
+    shape = (mesh_axis_size, x.shape[0] // mesh_axis_size) + x.shape[1:]
+    return x.view(shape).sum(0)
+
+def reinterpret_R_P(x):
+    return x * mesh_axis_size
+```
 
 ## Miscellaneous design notes
+
+From YZ: in global spmd, can represent partial as an extra dimension, hidden with vmap
 
   (NB: If the type system did not need to be erasable, we could elide the src
   argument from all comms, as we could simply read out the type from the
