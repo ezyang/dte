@@ -74,9 +74,11 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   autograd functions like `CopyToModelParallelRegion`.
 
 * Varying means that tensor has different values across the device mesh axis.
-  (Unlike the shard placement in DTensor, we don't know exactly how the differing
-  values across the mesh should be reassembled into a full tensor.)  The
-  gradient of varying is varying.
+  Unlike the shard placement in DTensor, we intentionally don't track how the
+  differing values should be reassembled into a full tensor--this is by design,
+  as local SPMD only needs to track enough information to ensure backwards
+  correctness, not full global tensor semantics.  The gradient of varying is
+  varying.
 
 * Partial means that there is a pending sum on the (differing) values
   across the device mesh axis, but it hasn't happened yet.  Delaying the reduction
@@ -137,8 +139,9 @@ distributed APIs:
   take the previous example, to convert from replicate to partial must zero
   out all but one of the tensors on the mesh axis, so that summing them up
   results in the original value.  When a tensor is varying, it is ambiguous
-  what the "semantics" of the tensor are, but by convention we assume that a
-  varying tensor is concatenated on tensor dim 0.  Like `reinterpret`, these
+  what the "semantics" of the tensor are, but by convention we interpret
+  varying as concatenation on dim 0, following the natural behavior of
+  collectives like all-gather and reduce-scatter.  Like `reinterpret`, these
   operations can have nontrivial backwards.
 
 TODO: Show local SPMD rules work even when the shapes across ranks are not the
@@ -392,9 +395,11 @@ src R  - X X /
 ### `convert(x, mesh_axis, src, tgt)`
 
 Convert from one local SPMD to another while preserving the semantics of the
-tensor.  The semantics of a varying tensor in this setting is interpreted to
-be the concatenation of all the tensors in the mesh on dim=0 (matching the
-semantics of all-gather).  Here are the supported conversions:
+tensor.  When a tensor is varying, it is ambiguous what the "semantics" of
+the tensor are; by convention we interpret varying as concatenation on dim=0,
+following the natural behavior of collectives like all-gather and reduce-scatter
+that split/combine along the outermost tensor dimension.  Here are the supported
+conversions:
 
 `convert(R,V): R -> V`, the backward is `convert(V,P) : V -> P`
 
