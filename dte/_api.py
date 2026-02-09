@@ -320,9 +320,9 @@ When i == 0:
 def all_reduce_spec(x: f32[*shape]) -> f32[*shape]:
     return x  # Identity! The summation already occured on x's conversion to Partial
 
-+A0
-+A1  =>  A0 + A1 + A2
-+A2
++Ax
++Ay  =>  Ax + Ay + Az
++Az
 ```
 
 Reduce shards along the mesh axis, so that every rank has the full summed value.
@@ -330,9 +330,9 @@ Reduce shards along the mesh axis, so that every rank has the full summed value.
 When `dst='replicate'`, aka `all_reduce(R): P -> R`, the backwards is `all_reduce(R): P -> R`
 
 ```
-                  +A0
-A0 + A1 + A2  <=  +A1
-                  +A2
+                  +Ax
+Ax + Ay + Az  <=  +Ay
+                  +Az
 ```
 
 When `dst='invariant'`, aka `all_reduce(I): P -> I`, the backwards is `reinterpret(I,R): I -> R`
@@ -354,16 +354,16 @@ def reduce_scatter_spec(x: f32[mesh_axis_size, *shape], dst) -> List[f32[*shape]
     match dst:
         case V:
             '''
-            +[A0, B0, C0]      A0 + A1 + A2
-            +[A1, B1, C1]  =>  B0 + B1 + B2
-            +[A2, B2, C2]      C0 + C1 + C2
+            +[Ax, Bx, Cx]      Ax + Ay + Az
+            +[Ay, By, Cy]  =>  Bx + By + Bz
+            +[Az, Bz, Cz]      Cx + Cy + Cz
             '''
             return x.unbind()
         case S(i):
             '''
             When i == 0:
             +[A0x, A1x, B0x, B1x, C0x, C1x]      [A0x + A0y + A0z, A1x + A1y + A1z]
-            +[A0y, A1y, B0y, B1y, C0y, C1y]  <=  [B0x + B0y + B0z, B1x + B1y + B1z]
+            +[A0y, A1y, B0y, B1y, C0y, C1y]  =>  [B0x + B0y + B0z, B1x + B1y + B1z]
             +[A0z, A1z, B0z, B1z, C0z, C1z]      [C0x + C0y + C0z, C1x + C1y + C1z]
             '''
             return 
@@ -373,18 +373,29 @@ def reduce_scatter_spec(x: f32[mesh_axis_size, *shape], dst) -> List[f32[*shape]
 Reduce shards along the mesh axis, but only get one shard of the result (e.g.,
 an inefficient implementation of reduce-scatter would be to all-reduce and
 then drop the data you did not need.)  Like `all_gather`, `dst` can either
-be varying for stack semantics, or shard for concat semantics (as we will see later).
+be varying for stack semantics, or shard for concat semantics.
 
-The forwards is `P -> V`, the backwards is `all_gather(V,R): V -> R`
+The backwards for each case:
+
+`reduce_scatter(V): P -> V`, the backwards is `all_gather(V,R): V -> R`.
 
 ```
-                     [A]
-[[A], [B], [C]]  <=  [B]
-                     [C]
+                  A
+[A, B, C]  <=  B
+                  C
+```
+
+`reduce_scatter(S(i)): P -> S(i)`, the backwards is `all_gather(S(i),R): S(i) -> R`.
+
+```
+When i == 0:
+                                         [A0, A1]
+[A0, A1, B0, B1, C0, C1]  <=  [B0, B1]
+                                         [C0, C1]
 ```
 
 It is common to want to reduce-scatter on varying data; just `reinterpret(V,P)`
-the data as partial before calling `reduce_scatter_stack`.
+the data as partial before calling `reduce_scatter`.
 
 ### `all_to_all(x, mesh_axis): Varying -> Varying`
 
@@ -448,9 +459,9 @@ Forward:
          [A]
 
 Backward:
-+[A0]      [A0]
-+[A1]  <=  [A1]
-+[A2]      [A2]
++A      A
++B  <=  B
++C      C
 ```
 
 `reinterpret(I,R): I -> R`, the backwards is `all_reduce(I): P -> I`
@@ -463,9 +474,9 @@ Forward:
 [A] => [A]
 
 Backward:
-                    +[A0]
-[A0 + A1 + A2]  <=  +[A1]
-                    +[A2]
+                    +[Ax]
+[Ax + Ay + Az]  <=  +[Ay]
+                    +[Az]
 ```
 
 `reinterpret(V,P): V -> P`, the backwards is `reinterpret(R,V): R -> V`
@@ -476,9 +487,9 @@ def reinterpret_V_P_spec(xs: List[f32[*shape]]) -> f32[*shape]:
     return sum(xs)
 
 Forward:
-[A0]      +[A0]
-[A1]  =>  +[A1]
-[A2]      +[A2]
+A      +A
+B  =>  +B
+C      +C
 
 Backward:
 [A]
@@ -1259,9 +1270,9 @@ def reduce_scatter(x, axis_name, *, scatter_dim: int = 0):
     Reduce shards along the mesh axis, but only get one shard of the result.
 
     ```
-    +[A0, B0, C0]      [A0 + A1 + A2]
-    +[A1, B1, C1]  =>  [B0 + B1 + B2]
-    +[A2, B2, C2]      [C0 + C1 + C2]
+    +[Ax, Bx, Cx]      [Ax + Ay + Az]
+    +[Ay, By, Cy]  =>  [Bx + By + Bz]
+    +[Az, Bz, Cz]      [Cx + Cy + Cz]
     ```
 
     Args:
