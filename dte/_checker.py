@@ -51,6 +51,30 @@ def set_spmd_types(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tensor:
     return tensor
 
 
+def assert_spmd_types(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tensor:
+    """
+    Assert or set SPMD types on a tensor.
+
+    If the tensor has no SPMD types, sets them.
+    If the tensor already has SPMD types, checks they equal the provided types.
+
+    Returns the tensor for chaining.
+
+    Raises:
+        TypeError: If types contain invalid values
+        AssertionError: If existing types don't match provided types
+    """
+    existing = get_spmd_types(tensor)
+    if not existing:
+        return set_spmd_types(tensor, types)
+
+    if existing != types:
+        raise AssertionError(
+            f"SPMD type mismatch: tensor has {existing}, expected {types}"
+        )
+    return tensor
+
+
 def get_spmd_type(tensor: torch.Tensor, axis: DeviceMeshAxis) -> PerMeshAxisSpmdType | None:
     """Get the SPMD type for a specific mesh axis, or None if not tracked."""
     return get_spmd_types(tensor).get(axis)

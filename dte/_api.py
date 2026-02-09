@@ -1638,25 +1638,22 @@ class _ReduceScatter(torch.autograd.Function):
         ctx.scatter_dim = scatter_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        result = funcol.reduce_scatter_tensor(x, "sum", scatter_dim, pg).wait()
         if stack:
-            chunks = torch.unbind(x, dim=scatter_dim)
-        else:
-            chunks = torch.chunk(x, world_size, dim=scatter_dim)
-        output = torch.empty_like(chunks[0])
-        dist.reduce_scatter(output, list(chunks), op=dist.ReduceOp.SUM, group=pg)
-        return output
+            return result.squeeze(scatter_dim)
+        return result
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(R): V -> R
         pg = _get_mesh_axis_group(ctx.axis)
         world_size = dist.get_world_size(pg)
-        gathered = [torch.empty_like(grad_out) for _ in range(world_size)]
-        dist.all_gather(gathered, grad_out, group=pg)
         if ctx.stack:
-            return torch.stack(gathered, dim=ctx.scatter_dim), None, None, None
-        return torch.cat(gathered, dim=ctx.scatter_dim), None, None, None
+            gathered = funcol.all_gather_tensor(grad_out.unsqueeze(ctx.scatter_dim), ctx.scatter_dim, pg).wait()
+            chunks = torch.chunk(gathered, world_size, dim=ctx.scatter_dim)
+            return torch.stack(chunks, dim=ctx.scatter_dim), None, None, None
+        gathered = funcol.all_gather_tensor(grad_out, ctx.scatter_dim, pg).wait()
+        return gathered, None, None, None
 
 
 def reduce_scatter(x, axis: "str | dist.ProcessGroup", *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType = V, scatter_dim: int = 0):
