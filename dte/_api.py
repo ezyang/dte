@@ -1054,49 +1054,207 @@ Related work: https://arxiv.org/pdf/2506.15961
 # TODO: There may be inaccuracies in the code below as I am still working on
 # it
 
-# NB: partial here denotes partial summation
+from dataclasses import dataclass
+from typing import Union
+
+# =============================================================================
+# Per-Mesh-Axis Local SPMD Type Hierarchy
+# =============================================================================
+
+
+class PerMeshAxisLocalSpmdType:
+    """
+    Base class for local SPMD types on a single mesh axis.
+
+    Describes how a tensor is distributed across ranks on one axis of the
+    device mesh, as well as how the gradients are distributed. The four
+    concrete types are: Replicate (R), Invariant (I), Varying (V), Partial (P).
+    """
+
+    def backward_type(self) -> "PerMeshAxisLocalSpmdType":
+        """Return the type that gradients have in the backward pass."""
+        raise NotImplementedError
+
+
+class Replicate(PerMeshAxisLocalSpmdType):
+    """
+    Replicate type - data is replicated across ranks.
+
+    The gradient of replicate is partial.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "R"
+
+    def backward_type(self) -> "PerMeshAxisLocalSpmdType":
+        return P
+
+
+class Invariant(PerMeshAxisLocalSpmdType):
+    """
+    Invariant type - data is replicated across ranks, gradient is also invariant.
+
+    Unlike replicate, the gradient is expected to already be synchronized.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "I"
+
+    def backward_type(self) -> "PerMeshAxisLocalSpmdType":
+        return I
+
+
+class Varying(PerMeshAxisLocalSpmdType):
+    """
+    Varying type - data differs across ranks.
+
+    The gradient of varying is also varying.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "V"
+
+    def backward_type(self) -> "PerMeshAxisLocalSpmdType":
+        return V
+
+
+class Partial(PerMeshAxisLocalSpmdType):
+    """
+    Partial type - pending sum across ranks.
+
+    The gradient of partial is replicate.
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "P"
+
+    def backward_type(self) -> "PerMeshAxisLocalSpmdType":
+        return R
+
+
+@dataclass(frozen=True)
+class Shard:
+    """
+    Shard type - varying on a specific tensor dimension.
+
+    Like Varying but rank-preserving; operates on a specific tensor dimension
+    rather than adding/removing dimensions. Used for concat semantics in
+    collectives (vs stack semantics for V).
+
+    The gradient of Shard(i) is also Shard(i).
+    """
+
+    dim: int
+
+    def __repr__(self):
+        return f"S({self.dim})"
+
+    def backward_type(self) -> "Shard":
+        return self
+
+
+# Single character singletons for ease of pattern matching
+R = Replicate()
+I = Invariant()
+V = Varying()
+P = Partial()
+S = Shard  # S(i) creates a Shard with dim=i
+
+# Type aliases
+PerMeshAxisSpmdType = Union[PerMeshAxisLocalSpmdType, Shard]
+LocalSpmdType = dict[str, PerMeshAxisSpmdType]
+# GlobalSpmdType = LocalSpmdType + PartitionSpec (TODO: define PartitionSpec)
+
+# For backwards compatibility with string-based API
 ALLOWED_PCAST_STATES = {'partial', 'replicate', 'varying', 'invariant'}
+
+# Mapping from strings to type singletons (for backwards compat)
+_STR_TO_TYPE = {
+    'replicate': R,
+    'invariant': I,
+    'varying': V,
+    'partial': P,
+}
+
+
+def _normalize_type(t: Union[str, PerMeshAxisSpmdType]) -> PerMeshAxisSpmdType:
+    """Convert string type to PerMeshAxisSpmdType if needed."""
+    if isinstance(t, str):
+        if t not in _STR_TO_TYPE:
+            raise ValueError(f"Invalid type string: {t}. Must be one of {list(_STR_TO_TYPE.keys())}")
+        return _STR_TO_TYPE[t]
+    if not isinstance(t, (PerMeshAxisLocalSpmdType, Shard)):
+        raise TypeError(f"Expected PerMeshAxisSpmdType or str, got {type(t)}")
+    return t
 
 
 class LTensor:
     """
     A tensor with local SPMD type annotations.
 
-    Tracks the local SPMD type (replicate, invariant, varying, partial) for each
-    mesh axis. This enables type-checking to ensure distributed operations
-    compute mathematically correct gradients.
+    Tracks the local SPMD type (R, I, V, P, or S(i)) for each mesh axis.
+    This enables type-checking to ensure distributed operations compute
+    mathematically correct gradients.
 
     Attributes:
         data: The underlying torch.Tensor
-        types: Dict mapping mesh axis names to local SPMD types
+        types: LocalSpmdType (dict mapping mesh axis names to PerMeshAxisSpmdType)
     """
 
-    def __init__(self, data: torch.Tensor, types: dict[str, str] | None = None):
+    def __init__(self, data: torch.Tensor, types: LocalSpmdType | None = None):
         """
         Create an LTensor with optional type annotations.
 
         Args:
             data: The underlying tensor
-            types: Dict mapping mesh axis names to types
-                   ('replicate', 'invariant', 'varying', 'partial')
+            types: LocalSpmdType - dict mapping mesh axis names to
+                   PerMeshAxisSpmdType (R, I, V, P, or S(i))
         """
         self.data = data
-        self.types = types if types is not None else {}
+        self.types: LocalSpmdType = types if types is not None else {}
         for axis_name, typ in self.types.items():
-            if typ not in ALLOWED_PCAST_STATES:
-                raise ValueError(
+            if not isinstance(typ, (PerMeshAxisLocalSpmdType, Shard)):
+                raise TypeError(
                     f"Invalid type '{typ}' for axis '{axis_name}'. "
-                    f"Must be one of {ALLOWED_PCAST_STATES}"
+                    f"Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))"
                 )
 
-    def get_type(self, axis_name: str) -> str | None:
+    def get_type(self, axis_name: str) -> PerMeshAxisSpmdType | None:
         """Get the local SPMD type for a mesh axis, or None if not tracked."""
         return self.types.get(axis_name)
 
-    def with_type(self, axis_name: str, typ: str) -> "LTensor":
+    def with_type(self, axis_name: str, typ: PerMeshAxisSpmdType) -> "LTensor":
         """Return a new LTensor with an updated type for the given axis."""
-        if typ not in ALLOWED_PCAST_STATES:
-            raise ValueError(f"Invalid type '{typ}'. Must be one of {ALLOWED_PCAST_STATES}")
+        if not isinstance(typ, (PerMeshAxisLocalSpmdType, Shard)):
+            raise TypeError(f"Invalid type '{typ}'. Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))")
         new_types = self.types.copy()
         new_types[axis_name] = typ
         return LTensor(self.data, new_types)
@@ -1110,12 +1268,12 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
     on each mesh axis, and the output inherits those types.
 
     For each mesh axis:
-    - If all operands are Replicate -> output is Replicate
-    - If all operands are Invariant -> output is Invariant
-    - If all operands are Varying -> output is Varying
-    - If operand is Partial -> only valid for linear operations on single Partial input
-    - Mixed Replicate/Varying -> output is Varying
-    - Invariant cannot mix with other types
+    - If all operands are R -> output is R
+    - If all operands are I -> output is I
+    - If all operands are V -> output is V
+    - If operand is P -> only valid for linear operations on single P input
+    - Mixed R/V -> output is V
+    - I cannot mix with other types
 
     Args:
         equation: The einsum equation string
@@ -1145,29 +1303,30 @@ def einsum(equation: str, *operands: LTensor) -> LTensor:
             continue
 
         # Check type compatibility and infer output type
-        unique_types = set(axis_types)
+        # Normalize types to their base class for comparison
+        type_classes = set(type(t) for t in axis_types)
 
-        if len(unique_types) == 1:
+        if len(type_classes) == 1:
             # All same type
             output_types[axis] = axis_types[0]
-        elif unique_types == {'replicate', 'varying'}:
+        elif type_classes == {Replicate, Varying}:
             # Mixed replicate/varying -> varying
-            output_types[axis] = 'varying'
-        elif 'invariant' in unique_types and len(unique_types) > 1:
+            output_types[axis] = V
+        elif Invariant in type_classes and len(type_classes) > 1:
             raise TypeError(
                 f"Invariant type on axis '{axis}' cannot mix with other types. "
                 f"Found types: {axis_types}"
             )
-        elif 'partial' in unique_types:
+        elif Partial in type_classes:
             # Partial can only appear alone (for linear ops) or with another partial
             # (for bilinear ops like matmul)
-            non_partial = unique_types - {'partial'}
+            non_partial = type_classes - {Partial}
             if non_partial:
                 raise TypeError(
                     f"Partial type on axis '{axis}' can only combine with partial. "
                     f"Found types: {axis_types}"
                 )
-            output_types[axis] = 'partial'
+            output_types[axis] = P
         else:
             raise TypeError(
                 f"Incompatible types on axis '{axis}': {axis_types}"
@@ -1260,30 +1419,33 @@ class _AllReduceToInvariant(torch.autograd.Function):
         return grad_out, None
 
 
-def all_reduce(x, axis_name, *, src: str = 'partial', dst: str):
+def all_reduce(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType):
     """
     Reduce shards along the mesh axis, so every rank has the full summed value.
 
     Args:
-        x: Input tensor with Partial type on the mesh axis
+        x: Input tensor with P type on the mesh axis
         axis_name: The mesh axis to reduce over
-        src: Source type (must be 'partial')
-        dst: Target type ('replicate' or 'invariant')
+        src: Source type (must be P)
+        dst: Target type (R or I)
 
     Returns:
-        Tensor with Replicate or Invariant type depending on dst
+        Tensor with R or I type depending on dst
 
-    When dst='replicate', backward is all_reduce(R): P -> R
-    When dst='invariant', backward is reinterpret(I,R): I -> R (no-op)
+    When dst=R, backward is all_reduce(R): P -> R
+    When dst=I, backward is reinterpret(I,R): I -> R (no-op)
     """
-    if src != 'partial':
-        raise ValueError(f"all_reduce src must be 'partial', got {src}")
-    if dst == 'replicate':
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    if src is not P:
+        raise ValueError(f"all_reduce src must be P, got {src}")
+    if dst is R:
         return _AllReduceToReplicate.apply(x, axis_name)
-    elif dst == 'invariant':
+    elif dst is I:
         return _AllReduceToInvariant.apply(x, axis_name)
     else:
-        raise ValueError(f"all_reduce dst must be 'replicate' or 'invariant', got {dst}")
+        raise ValueError(f"all_reduce dst must be R or I, got {dst}")
 
 
 # =============================================================================
@@ -1342,7 +1504,7 @@ class _AllGatherToInvariant(torch.autograd.Function):
         return chunks[rank].contiguous(), None, None
 
 
-def all_gather(x, axis_name, *, dst: str, gather_dim: int = 0):
+def all_gather(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType, gather_dim: int = 0):
     """
     Gather shards along the mesh axis, so every rank has the full copy of data.
 
@@ -1353,23 +1515,31 @@ def all_gather(x, axis_name, *, dst: str, gather_dim: int = 0):
     ```
 
     Args:
-        x: Input tensor with Varying type on the mesh axis
+        x: Input tensor with V or S(i) type on the mesh axis
         axis_name: The mesh axis to gather over
-        dst: Target type ('replicate' or 'invariant')
+        src: Source type (V or S(i))
+        dst: Target type (R or I)
         gather_dim: The tensor dimension to concatenate along (default: 0)
 
     Returns:
-        Tensor with Replicate or Invariant type depending on dst
+        Tensor with R or I type depending on dst
 
-    When dst='replicate', backward is reduce_scatter: P -> V
-    When dst='invariant', backward is convert(I,V): I -> V
+    When dst=R, backward is reduce_scatter: P -> V
+    When dst=I, backward is convert(I,V): I -> V
     """
-    if dst == 'replicate':
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    # Validate src is V or S(i)
+    if not (src is V or isinstance(src, Shard)):
+        raise ValueError(f"all_gather src must be V or S(i), got {src}")
+
+    if dst is R:
         return _AllGatherToReplicate.apply(x, axis_name, gather_dim)
-    elif dst == 'invariant':
+    elif dst is I:
         return _AllGatherToInvariant.apply(x, axis_name, gather_dim)
     else:
-        raise ValueError(f"all_gather dst must be 'replicate' or 'invariant', got {dst}")
+        raise ValueError(f"all_gather dst must be R or I, got {dst}")
 
 
 # =============================================================================
@@ -1395,7 +1565,7 @@ class _ReduceScatter(torch.autograd.Function):
         return funcol.all_gather_tensor(grad_out, ctx.scatter_dim, pg).wait(), None, None
 
 
-def reduce_scatter(x, axis_name, *, scatter_dim: int = 0):
+def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSpmdType = V, scatter_dim: int = 0):
     """
     Reduce shards along the mesh axis, but only get one shard of the result.
 
@@ -1406,15 +1576,25 @@ def reduce_scatter(x, axis_name, *, scatter_dim: int = 0):
     ```
 
     Args:
-        x: Input tensor with Partial type on the mesh axis
+        x: Input tensor with P type on the mesh axis
         axis_name: The mesh axis to reduce-scatter over
+        src: Source type (must be P)
+        dst: Target type (V or S(i))
         scatter_dim: The tensor dimension to scatter along (default: 0)
 
     Returns:
-        Tensor with Varying type
+        Tensor with V or S(i) type depending on dst
 
     The backward is all_gather(R): V -> R
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    if src is not P:
+        raise ValueError(f"reduce_scatter src must be P, got {src}")
+    if not (dst is V or isinstance(dst, Shard)):
+        raise ValueError(f"reduce_scatter dst must be V or S(i), got {dst}")
+
     return _ReduceScatter.apply(x, axis_name, scatter_dim)
 
 
@@ -1451,7 +1631,7 @@ class _AllToAll(torch.autograd.Function):
         return torch.cat(output_chunks, dim=ctx.split_dim), None, None, None
 
 
-def all_to_all(x, axis_name, *, split_dim: int = 0, concat_dim: int = 0):
+def all_to_all(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSpmdType = V, split_dim: int = 0, concat_dim: int = 0):
     """
     Transpose a local tensor axis with the mesh axis.
 
@@ -1462,16 +1642,27 @@ def all_to_all(x, axis_name, *, split_dim: int = 0, concat_dim: int = 0):
     ```
 
     Args:
-        x: Input tensor with Varying type on the mesh axis
+        x: Input tensor with V or S(i) type on the mesh axis
         axis_name: The mesh axis to transpose with
+        src: Source type (V or S(i))
+        dst: Target type (V or S(j))
         split_dim: The tensor dimension to split along (default: 0)
         concat_dim: The tensor dimension to concatenate along (default: 0)
 
     Returns:
-        Tensor with Varying type
+        Tensor with V or S(j) type depending on dst
 
-    The backward is also all_to_all: V -> V
+    The backward is also all_to_all: V -> V (with src/dst swapped)
     """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    # Validate src and dst are V or S(i)
+    if not (src is V or isinstance(src, Shard)):
+        raise ValueError(f"all_to_all src must be V or S(i), got {src}")
+    if not (dst is V or isinstance(dst, Shard)):
+        raise ValueError(f"all_to_all dst must be V or S(i), got {dst}")
+
     return _AllToAll.apply(x, axis_name, split_dim, concat_dim)
 
 
@@ -1546,7 +1737,7 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 
 # Update reinterpret to handle all cases
-def reinterpret(x, axis_name, *, src: str, dst: str):
+def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType):
     """
     Coerce from one local SPMD type to another without changing the local tensor.
 
@@ -1556,8 +1747,8 @@ def reinterpret(x, axis_name, *, src: str, dst: str):
     Args:
         x: Input tensor
         axis_name: The mesh axis to operate on
-        src: Source local SPMD type ('replicate', 'invariant', 'varying', 'partial')
-        dst: Target local SPMD type ('replicate', 'invariant', 'varying', 'partial')
+        src: Source local SPMD type (R, I, V, P)
+        dst: Target local SPMD type (R, I, V, P)
 
     Supported coercions:
         - reinterpret(R,I): R -> I, backward is convert(I,P): I -> P
@@ -1565,35 +1756,43 @@ def reinterpret(x, axis_name, *, src: str, dst: str):
         - reinterpret(R,P): R -> P, backward is reinterpret(R,P): R -> P
         - reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I
         - reinterpret(V,P): V -> P, backward is reinterpret(R,V): R -> V
-    """
-    if src not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid src state: {src}. Must be one of {ALLOWED_PCAST_STATES}")
-    if dst not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid dst state: {dst}. Must be one of {ALLOWED_PCAST_STATES}")
 
-    if src == dst:
+    Note: This API does not support S(i) for src/dst, because the restriction
+    on no local tensor change means the semantics would be the same as V.
+    """
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
+
+    # Validate no Shard types
+    if isinstance(src, Shard) or isinstance(dst, Shard):
+        raise ValueError(
+            f"reinterpret does not support S(i). Use V instead, or use convert for "
+            f"semantics-preserving conversions. Got src={src}, dst={dst}"
+        )
+
+    if src is dst:
         return x  # no-op
 
-    if src == 'replicate' and dst == 'varying':
+    if src is R and dst is V:
         return _ReplicateToVarying.apply(x, axis_name)
-    elif src == 'replicate' and dst == 'invariant':
+    elif src is R and dst is I:
         return _ReplicateToInvariant.apply(x, axis_name)
-    elif src == 'replicate' and dst == 'partial':
+    elif src is R and dst is P:
         return _ReplicateToPartial.apply(x, axis_name)
-    elif src == 'invariant' and dst == 'replicate':
+    elif src is I and dst is R:
         return _InvariantToReplicate.apply(x, axis_name)
-    elif src == 'invariant' and dst == 'varying':
+    elif src is I and dst is V:
         # Composition: I -> R -> V
         return _ReplicateToVarying.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
-    elif src == 'invariant' and dst == 'partial':
+    elif src is I and dst is P:
         # Composition: I -> R -> P
         return _ReplicateToPartial.apply(_InvariantToReplicate.apply(x, axis_name), axis_name)
-    elif src == 'varying' and dst == 'partial':
+    elif src is V and dst is P:
         return _VaryingToPartial.apply(x, axis_name)
     else:
         raise ValueError(
             f"reinterpret({src}, {dst}) is not supported. "
-            "Cannot reinterpret from partial or to varying/replicate from varying."
+            "Cannot reinterpret from P or to V/R from V."
         )
 
 
@@ -1797,7 +1996,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
             return _replicate_to_varying_fwd(grad_out, world_size, ctx.split_dim, rank), None, None
 
 
-def convert(x, axis_name, *, src: str, dst: str, dim: int = 0):
+def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType, dim: int = 0):
     """
     Convert from one local SPMD type to another while preserving tensor semantics.
 
@@ -1807,46 +2006,58 @@ def convert(x, axis_name, *, src: str, dst: str, dim: int = 0):
     Args:
         x: Input tensor
         axis_name: The mesh axis to operate on
-        src: Source local SPMD type
-        dst: Target local SPMD type
-        dim: The tensor dimension for split/concat operations (default: 0)
+        src: Source local SPMD type (R, I, V, P, or S(i))
+        dst: Target local SPMD type (R, I, V, P, or S(i))
+        dim: The tensor dimension for split/concat operations (default: 0).
+             When src or dst is S(i), the dim from S(i) is used instead.
 
     Supported conversions:
         - convert(R,V): R -> V, backward is convert(V,P): V -> P
+        - convert(R,S(i)): R -> S(i), backward is convert(S(i),P): S(i) -> P
         - convert(I,V): I -> V, backward is all_gather(I): V -> I
+        - convert(I,S(i)): I -> S(i), backward is all_gather(S(i),I): S(i) -> I
         - convert(R,P): R -> P, backward is convert(R,P): R -> P
         - convert(I,P): I -> P, backward is reinterpret(R,I): R -> I
         - convert(V,P): V -> P, backward is convert(R,V): R -> V
+        - convert(S(i),P): S(i) -> P, backward is convert(R,S(i)): R -> S(i)
         - convert(R,I) and convert(I,R) are same as reinterpret
     """
-    if src not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid src state: {src}. Must be one of {ALLOWED_PCAST_STATES}")
-    if dst not in ALLOWED_PCAST_STATES:
-        raise ValueError(f"Invalid dst state: {dst}. Must be one of {ALLOWED_PCAST_STATES}")
+    src = _normalize_type(src)
+    dst = _normalize_type(dst)
 
-    if src == dst:
+    # Extract dim from Shard if present
+    if isinstance(src, Shard):
+        dim = src.dim
+    if isinstance(dst, Shard):
+        dim = dst.dim
+
+    # Normalize Shard to V for dispatch (they use the same underlying functions)
+    src_base = V if isinstance(src, Shard) else src
+    dst_base = V if isinstance(dst, Shard) else dst
+
+    if src_base is dst_base:
         return x  # no-op
 
-    if src == 'replicate' and dst == 'varying':
+    if src_base is R and dst_base is V:
         return _ConvertReplicateToVarying.apply(x, axis_name, dim)
-    elif src == 'replicate' and dst == 'partial':
+    elif src_base is R and dst_base is P:
         return _ConvertReplicateToPartial.apply(x, axis_name)
-    elif src == 'replicate' and dst == 'invariant':
+    elif src_base is R and dst_base is I:
         # Same as reinterpret
         return _ReplicateToInvariant.apply(x, axis_name)
-    elif src == 'invariant' and dst == 'varying':
+    elif src_base is I and dst_base is V:
         return _ConvertInvariantToVarying.apply(x, axis_name, dim)
-    elif src == 'invariant' and dst == 'partial':
+    elif src_base is I and dst_base is P:
         return _ConvertInvariantToPartial.apply(x, axis_name)
-    elif src == 'invariant' and dst == 'replicate':
+    elif src_base is I and dst_base is R:
         # Same as reinterpret
         return _InvariantToReplicate.apply(x, axis_name)
-    elif src == 'varying' and dst == 'partial':
+    elif src_base is V and dst_base is P:
         return _ConvertVaryingToPartial.apply(x, axis_name, dim)
     else:
         raise ValueError(
             f"convert({src}, {dst}) is not supported. "
-            "Cannot convert out of partial."
+            "Cannot convert out of P."
         )
 
 
