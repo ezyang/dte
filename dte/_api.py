@@ -842,11 +842,13 @@ print the partition spec along with the shape of a tensor; so for example,
 mesh axis.  It is only legal for varying mesh dimensions to occur in the
 partition spec.
 
-(Aside: another way we could have defined the global SPMD type is by replacing
-Varying with Shard(tensor dim), which is indeed how PyTorch DTensor defines
-sharding.  However, most people find the JAX-style tensor dim more intuitive
-to work with, and it is nice to be able to factor the global SPMD type
-into a local SPMD type plus something extra!)
+(Aside: already in the local SPMD API, we have also made available a Shard(i)
+for expressing sharding on a per-device mesh basis.  This form can be more
+convenient when doing global SPMD transformations on a per-mesh axis basis,
+but it comes with a gotcha: you can only manipulate the *last* mesh axis that
+shards a particular mesh dimension.  Many people find the JAX-style tensor dim
+oriented partition specmore intuitive to work with, and the global SPMD APIs
+will emphasize this.)
 
 We continue to do local SPMD type checking as described above.  Our new
 problem is to describe the shard propagation rules for partition spec.
