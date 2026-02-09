@@ -1174,8 +1174,7 @@ LocalSpmdType = dict[str, PerMeshAxisSpmdType]
 # =============================================================================
 
 
-@dataclass(frozen=True)
-class PartitionSpec:
+class PartitionSpec(tuple):
     """
     A partition spec describes how tensor dimensions map to mesh axes.
 
@@ -1189,17 +1188,14 @@ class PartitionSpec:
     that dim 0 (size 8) is sharded on 'tp' while dim 1 (size 16) is replicated.
     """
 
-    # Each element is None (replicated), a str (single mesh axis), or tuple of str (multiple axes)
-    spec: tuple[str | tuple[str, ...] | None, ...] = ()
-
-    def __init__(self, *args: str | tuple[str, ...] | None):
-        object.__setattr__(self, 'spec', args)
+    def __new__(cls, *args: str | tuple[str, ...] | None):
+        return super().__new__(cls, args)
 
     def __repr__(self):
-        if not self.spec:
+        if not self:
             return "PartitionSpec()"
         parts = []
-        for s in self.spec:
+        for s in self:
             if s is None:
                 parts.append("None")
             elif isinstance(s, tuple):
@@ -1208,19 +1204,10 @@ class PartitionSpec:
                 parts.append(repr(s))
         return f"PartitionSpec({', '.join(parts)})"
 
-    def __len__(self):
-        return len(self.spec)
-
-    def __getitem__(self, idx):
-        return self.spec[idx]
-
-    def __iter__(self):
-        return iter(self.spec)
-
     def get_mesh_axes(self) -> set[str]:
         """Return all mesh axis names mentioned in this spec."""
         axes = set()
-        for s in self.spec:
+        for s in self:
             if s is None:
                 continue
             elif isinstance(s, tuple):
@@ -1231,33 +1218,10 @@ class PartitionSpec:
 
     def is_replicated(self) -> bool:
         """Return True if all dimensions are replicated (no sharding)."""
-        return all(s is None for s in self.spec)
+        return all(s is None for s in self)
 
 
 GlobalSpmdType = tuple[LocalSpmdType, PartitionSpec]
-
-# For backwards compatibility with string-based API
-ALLOWED_PCAST_STATES = {'partial', 'replicate', 'varying', 'invariant'}
-
-# Mapping from strings to type singletons (for backwards compat)
-_STR_TO_TYPE = {
-    'replicate': R,
-    'invariant': I,
-    'varying': V,
-    'partial': P,
-}
-
-
-def _normalize_type(t: Union[str, PerMeshAxisSpmdType]) -> PerMeshAxisSpmdType:
-    """Convert string type to PerMeshAxisSpmdType if needed."""
-    if isinstance(t, str):
-        if t not in _STR_TO_TYPE:
-            raise ValueError(f"Invalid type string: {t}. Must be one of {list(_STR_TO_TYPE.keys())}")
-        return _STR_TO_TYPE[t]
-    if not isinstance(t, (PerMeshAxisLocalSpmdType, Shard)):
-        raise TypeError(f"Expected PerMeshAxisSpmdType or str, got {type(t)}")
-    return t
-
 
 class LTensor:
     """
@@ -1510,9 +1474,6 @@ def all_reduce(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAxisSp
     When dst=R, backward is all_reduce(R): P -> R
     When dst=I, backward is reinterpret(I,R): I -> R (no-op)
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     if src is not P:
         raise ValueError(f"all_reduce src must be P, got {src}")
     if dst is R:
@@ -1602,9 +1563,6 @@ def all_gather(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
     When dst=R, backward is reduce_scatter: P -> V
     When dst=I, backward is convert(I,V): I -> V
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     # Validate src is V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_gather src must be V or S(i), got {src}")
@@ -1662,9 +1620,6 @@ def reduce_scatter(x, axis_name, *, src: PerMeshAxisSpmdType = P, dst: PerMeshAx
 
     The backward is all_gather(R): V -> R
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     if src is not P:
         raise ValueError(f"reduce_scatter src must be P, got {src}")
     if not (dst is V or isinstance(dst, Shard)):
@@ -1729,9 +1684,6 @@ def all_to_all(x, axis_name, *, src: PerMeshAxisSpmdType = V, dst: PerMeshAxisSp
 
     The backward is also all_to_all: V -> V (with src/dst swapped)
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     # Validate src and dst are V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_to_all src must be V or S(i), got {src}")
@@ -1837,9 +1789,6 @@ def reinterpret(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdT
     Note: This API does not support S(i) for src/dst, because the restriction
     on no local tensor change means the semantics would be the same as V.
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     # Validate no Shard types
     if isinstance(src, Shard) or isinstance(dst, Shard):
         raise ValueError(
@@ -2095,9 +2044,6 @@ def convert(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmdType,
         - convert(S(i),P): S(i) -> P, backward is convert(R,S(i)): R -> S(i)
         - convert(R,I) and convert(I,R) are same as reinterpret
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim
@@ -2170,9 +2116,6 @@ def redistribute(x, axis_name, *, src: PerMeshAxisSpmdType, dst: PerMeshAxisSpmd
     For conversions that don't require comms (R<->I, R->V, R->P, I->V, I->P, V->P),
     this function delegates to convert or reinterpret as appropriate.
     """
-    src = _normalize_type(src)
-    dst = _normalize_type(dst)
-
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim

@@ -118,6 +118,48 @@ class LocalTensorTestCase(unittest.TestCase):
         )
         self.assertFalse(all_same, f"{msg}: expected different values per rank")
 
+    def _check_backward_not_none(self, autograd_fn_class, forward_args, backward_grad_out):
+        """
+        Verify that an autograd Function's backward returns valid gradients (not None).
+
+        This directly tests the backward method of autograd Functions to catch bugs
+        like returning None instead of the actual gradient tensor.
+
+        Args:
+            autograd_fn_class: The torch.autograd.Function class to test
+            forward_args: Tuple of args to pass to forward (will also set up ctx)
+            backward_grad_out: The gradient output to pass to backward
+
+        Returns:
+            The result of the backward call
+        """
+        # Create a context object
+        class FakeCtx:
+            pass
+        ctx = FakeCtx()
+
+        # Run forward to populate ctx
+        autograd_fn_class.forward(ctx, *forward_args)
+
+        # Run backward
+        result = autograd_fn_class.backward(ctx, backward_grad_out)
+
+        # Check that the gradient for the main input (first element) is not None
+        if isinstance(result, tuple):
+            grad_input = result[0]
+        else:
+            grad_input = result
+
+        self.assertIsNotNone(grad_input, f"{autograd_fn_class.__name__}.backward returned None")
+
+        # Also verify it's a proper tensor/LocalTensor with the right shape
+        if isinstance(backward_grad_out, LocalTensor):
+            self.assertIsInstance(grad_input, LocalTensor)
+        else:
+            self.assertIsInstance(grad_input, torch.Tensor)
+
+        return result
+
 
 class TestLTensorCreation(unittest.TestCase):
     """Test LTensor creation and validation (no LocalTensorMode needed)."""
@@ -832,15 +874,6 @@ class TestEinsumSingleOperand(unittest.TestCase):
         self.assertEqual(result.get_type('tp'), P)
 
 
-class TestPcast(unittest.TestCase):
-    """Test that pcast is an alias for reinterpret."""
-
-    def test_pcast_is_reinterpret(self):
-        """pcast should be the same function as reinterpret."""
-        from dte._api import pcast
-        self.assertIs(pcast, reinterpret)
-
-
 class TestTypeSingletons(unittest.TestCase):
     """Test that type objects are singletons."""
 
@@ -1046,6 +1079,106 @@ class TestRedistribute(LocalTensorTestCase):
         for r in range(self.WORLD_SIZE):
             self.assertEqual(result._local_tensors[r].shape[0], 1)
             self.assertEqual(result._local_tensors[r].shape[1], 6)
+
+
+class TestAutogradFunctionBackward(LocalTensorTestCase):
+    """
+    Test that autograd Function backward methods return valid gradients.
+
+    These tests directly invoke the backward methods of the autograd Functions
+    in _api.py to verify they return proper tensors (not None). This catches
+    bugs like using dist.all_reduce (which returns None) instead of
+    funcol.all_reduce(...).wait() (which returns the tensor).
+    """
+
+    def test_all_reduce_to_replicate_backward(self):
+        """_AllReduceToReplicate.backward should return valid gradient."""
+        from dte._api import _AllReduceToReplicate
+        x = self._generate_inputs((4,), 'partial')
+        grad_out = self._generate_inputs((4,), 'partial')
+        self._check_backward_not_none(_AllReduceToReplicate, (x, 'tp'), grad_out)
+
+    def test_all_reduce_to_invariant_backward(self):
+        """_AllReduceToInvariant.backward should return valid gradient."""
+        from dte._api import _AllReduceToInvariant
+        x = self._generate_inputs((4,), 'partial')
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_AllReduceToInvariant, (x, 'tp'), grad_out)
+
+    def test_invariant_to_replicate_backward(self):
+        """_InvariantToReplicate.backward should return valid gradient.
+
+        This is the operation that had the bug (returning None from dist.all_reduce).
+        """
+        from dte._api import _InvariantToReplicate
+        x = self._generate_inputs((4,), 'invariant')
+        grad_out = self._generate_inputs((4,), 'partial')
+        self._check_backward_not_none(_InvariantToReplicate, (x, 'tp'), grad_out)
+
+    def test_replicate_to_invariant_backward(self):
+        """_ReplicateToInvariant.backward should return valid gradient."""
+        from dte._api import _ReplicateToInvariant
+        x = self._generate_inputs((4,), 'replicate')
+        grad_out = self._generate_inputs((4,), 'invariant')
+        self._check_backward_not_none(_ReplicateToInvariant, (x, 'tp'), grad_out)
+
+    def test_replicate_to_varying_backward(self):
+        """_ReplicateToVarying.backward should return valid gradient."""
+        from dte._api import _ReplicateToVarying
+        x = self._generate_inputs((4,), 'replicate')
+        grad_out = self._generate_inputs((4,), 'varying')
+        self._check_backward_not_none(_ReplicateToVarying, (x, 'tp'), grad_out)
+
+    def test_varying_to_partial_backward(self):
+        """_VaryingToPartial.backward should return valid gradient."""
+        from dte._api import _VaryingToPartial
+        x = self._generate_inputs((4,), 'varying')
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_VaryingToPartial, (x, 'tp'), grad_out)
+
+    def test_replicate_to_partial_backward(self):
+        """_ReplicateToPartial.backward should return valid gradient."""
+        from dte._api import _ReplicateToPartial
+        x = self._generate_inputs((4,), 'replicate')
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_ReplicateToPartial, (x, 'tp'), grad_out)
+
+    def test_convert_replicate_to_varying_backward(self):
+        """_ConvertReplicateToVarying.backward should return valid gradient."""
+        from dte._api import _ConvertReplicateToVarying
+        x = self._generate_inputs((6,), 'replicate')
+        # Output is smaller (chunked)
+        grad_out = self._generate_inputs((2,), 'varying')
+        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0), grad_out)
+
+    def test_convert_invariant_to_varying_backward(self):
+        """_ConvertInvariantToVarying.backward should return valid gradient."""
+        from dte._api import _ConvertInvariantToVarying
+        x = self._generate_inputs((6,), 'invariant')
+        grad_out = self._generate_inputs((2,), 'varying')
+        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0), grad_out)
+
+    def test_convert_replicate_to_partial_backward(self):
+        """_ConvertReplicateToPartial.backward should return valid gradient."""
+        from dte._api import _ConvertReplicateToPartial
+        x = self._generate_inputs((4,), 'replicate')
+        grad_out = self._generate_inputs((4,), 'replicate')
+        self._check_backward_not_none(_ConvertReplicateToPartial, (x, 'tp'), grad_out)
+
+    def test_convert_invariant_to_partial_backward(self):
+        """_ConvertInvariantToPartial.backward should return valid gradient."""
+        from dte._api import _ConvertInvariantToPartial
+        x = self._generate_inputs((4,), 'invariant')
+        grad_out = self._generate_inputs((4,), 'invariant')
+        self._check_backward_not_none(_ConvertInvariantToPartial, (x, 'tp'), grad_out)
+
+    def test_convert_varying_to_partial_backward(self):
+        """_ConvertVaryingToPartial.backward should return valid gradient."""
+        from dte._api import _ConvertVaryingToPartial
+        x = self._generate_inputs((2,), 'varying')
+        # Output is larger (padded)
+        grad_out = self._generate_inputs((6,), 'replicate')
+        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0), grad_out)
 
 
 if __name__ == '__main__':
