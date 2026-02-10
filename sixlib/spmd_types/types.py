@@ -201,3 +201,33 @@ class PartitionSpec(tuple):
 
 
 GlobalSpmdType = tuple[LocalSpmdType, PartitionSpec]
+
+
+class SpmdTypeError(RuntimeError):
+    """Error raised for SPMD type mismatches.
+
+    Inherits from RuntimeError (not TypeError) so that it is not swallowed by
+    Python's binary-operator dispatch machinery when raised inside
+    ``__torch_function__``.  Python interprets a TypeError from an operator
+    dunder as "this type doesn't support the operation" and silently falls
+    through to reflected operations, masking the real error message.
+    """
+
+    pass
+
+
+def format_axis(axis: DeviceMeshAxis) -> str:
+    """Format a mesh axis for display in error messages.
+
+    For string axes, returns the repr (e.g., ``'tp'``).
+    For ProcessGroup axes, uses ``group_desc`` when available to produce a
+    bare human-readable name (e.g., ``TP``) instead of the default opaque
+    object repr.
+    """
+    if isinstance(axis, str):
+        return repr(axis)
+    # ProcessGroup - use group_desc for a readable name
+    desc = getattr(axis, "group_desc", None)
+    if desc and desc != "undefined":
+        return desc
+    return repr(axis)

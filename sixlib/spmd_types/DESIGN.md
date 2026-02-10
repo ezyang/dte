@@ -807,7 +807,6 @@ vice versa.  Also remember that the backwards of a backwards is its forwards,
 so you can read the table left-to-right and right-to-left (but for ease of
 reading, we've included the flipped rows explicitly).
 
-```
 Fwd Type    Forward                 Bwd Type    Backward
 ----------------------------------------------------------------------------
 R -> I      reinterpret(R,I)        I -> P      convert(I,P)
@@ -826,7 +825,6 @@ V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
-```
 
 # Global SPMD
 
@@ -1031,3 +1029,24 @@ implicit sharding transformations seems too much.  Another example: we do have
 dtype promotion in eager, but it's a debatable decision.  Sharding is similar
 to shape/dtype metadata.  Device is a good example, we don't move it
 automatically between devices.
+
+## Unresolved problems
+
+- What to do about async?
+- What to do about contiguity?
+
+
+
+
+How should type asserts work?  Can you omit PGs from the type assert?
+
+Classic example is data parallelism.  Megatron code will have the DP implicit.
+Seems like bad UX to force people to spell it out.  But then what should it
+default to?  Varying is the obvious choice.
+
+Have to worry about PG overlap, not sure if there's an efficient way to test
+this right now.
+
+TODO: need to worry about intermixed PG / mesh axis names
+
+TODO: worry about runtime cost of setting types inside the function body

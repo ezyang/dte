@@ -1,7 +1,6 @@
 """Global device mesh management for SPMD operations."""
 
-import torch.distributed as dist
-
+from torch.distributed import ProcessGroup
 
 # Global device mesh storage
 _global_mesh = None
@@ -29,13 +28,13 @@ def get_mesh():
     return _global_mesh
 
 
-def _get_mesh_axis_group(axis: "str | dist.ProcessGroup") -> dist.ProcessGroup:
+def _get_mesh_axis_group(axis: "str | ProcessGroup") -> ProcessGroup:
     """Get the process group for a mesh axis.
 
     If axis is already a ProcessGroup, return it directly.
     If axis is a string, look it up from the global mesh.
     """
-    if isinstance(axis, dist.ProcessGroup):
+    if isinstance(axis, ProcessGroup):
         return axis
     # It's a string axis name
     if _global_mesh is None:

@@ -1,6 +1,10 @@
 # spmd_types package
 
 # Collectives and operations
+from sixlib.spmd_types._checker import (
+    assert_type,
+    SpmdTypeMode,
+)
 from sixlib.spmd_types._collectives import (
     all_gather,
     all_reduce,
@@ -8,6 +12,7 @@ from sixlib.spmd_types._collectives import (
     redistribute,
     reduce_scatter,
 )
+from sixlib.spmd_types._dist import set_dist
 from sixlib.spmd_types._local import (
     convert,
     reinterpret,
@@ -31,6 +36,7 @@ from sixlib.spmd_types.types import (
     Replicate,
     S,
     Shard,
+    SpmdTypeError,
     V,
     Varying,
 )

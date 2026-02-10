@@ -1,8 +1,7 @@
 """Distributed collective operations: all_reduce, all_gather, reduce_scatter, all_to_all, redistribute."""
 
 import torch
-import torch.distributed as dist
-import torch.distributed._functional_collectives as funcol
+from sixlib.spmd_types import _dist
 from sixlib.spmd_types._local import convert, reinterpret
 from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
@@ -13,6 +12,8 @@ from sixlib.spmd_types.types import (
     Shard,
     V,
 )
+from torch.distributed import ProcessGroup
+from torch.overrides import handle_torch_function, has_torch_function_unary
 
 # =============================================================================
 # all_reduce: P -> R | I
@@ -31,25 +32,34 @@ class _AllReduce(torch.autograd.Function):
         ctx.axis = axis
         ctx.dst = dst
         pg = _get_mesh_axis_group(axis)
+        # TODO: check if contiguous assertion is really necessary
+        assert x.is_contiguous(), "all_reduce input must be contiguous"
+        # TODO: check if world_size == 1 short-circuit is really necessary
+        if _dist.dist.get_world_size(pg) == 1:
+            return x
         if inplace:
-            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=pg)
+            _dist.dist.all_reduce(x, op=_dist.dist.ReduceOp.SUM, group=pg)
             ctx.mark_dirty(x)
             return x
-        return funcol.all_reduce(x, "sum", pg).wait()
+        else:
+            result = x.clone()
+            _dist.dist.all_reduce(result, op=_dist.dist.ReduceOp.SUM, group=pg)
+            return result
 
     @staticmethod
     def backward(ctx, grad_out):
         if ctx.dst is R:
             # backward of P -> R is P -> R (same operation)
-            return all_reduce(grad_out, ctx.axis, src=P, dst=R), None, None, None
+            grad = all_reduce(grad_out, ctx.axis, src=P, dst=R)
         else:
             # backward of P -> I: reinterpret(I,R) is identity but sets up autograd for double backward
-            return reinterpret(grad_out, ctx.axis, src=I, dst=R), None, None, None
+            grad = reinterpret(grad_out, ctx.axis, src=I, dst=R)
+        return grad, None, None, None
 
 
 def all_reduce(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType,
@@ -72,6 +82,16 @@ def all_reduce(
     When dst=R, backward is all_reduce(R): P -> R
     When dst=I, backward is reinterpret(I,R): I -> R (no-op)
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            all_reduce,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+            inplace=inplace,
+        )
     if src is not P:
         if src is V:
             x = reinterpret(x, axis, src=V, dst=P)
@@ -87,7 +107,6 @@ def all_reduce(
         return _AllReduce.apply(x, axis, dst, inplace)
     else:
         raise ValueError(f"all_reduce dst must be R or I, got {dst}")
-
 
 # =============================================================================
 # all_gather: V -> R | I
@@ -108,9 +127,9 @@ class _AllGather(torch.autograd.Function):
         ctx.gather_dim = gather_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
         gathered = [torch.empty_like(x) for _ in range(world_size)]
-        dist.all_gather(gathered, x, group=pg)
+        _dist.dist.all_gather(gathered, x, group=pg)
         if stack:
             return torch.stack(gathered, dim=gather_dim)
         return torch.cat(gathered, dim=gather_dim)
@@ -120,29 +139,18 @@ class _AllGather(torch.autograd.Function):
         dst_type = V if ctx.stack else Shard(ctx.gather_dim)
         if ctx.dst is R:
             # backward is reduce_scatter: P -> V
-            return (
-                reduce_scatter(
-                    grad_out, ctx.axis, src=P, dst=dst_type, scatter_dim=ctx.gather_dim
-                ),
-                None,
-                None,
-                None,
-                None,
+            grad = reduce_scatter(
+                grad_out, ctx.axis, src=P, dst=dst_type, scatter_dim=ctx.gather_dim
             )
         else:
             # backward is convert(I,V): I -> V
-            return (
-                convert(grad_out, ctx.axis, src=I, dst=dst_type, dim=ctx.gather_dim),
-                None,
-                None,
-                None,
-                None,
-            )
+            grad = convert(grad_out, ctx.axis, src=I, dst=dst_type, dim=ctx.gather_dim)
+        return grad, None, None, None, None
 
 
 def all_gather(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType,
@@ -168,6 +176,15 @@ def all_gather(
     When dst=R, backward is reduce_scatter: P -> V
     When dst=I, backward is convert(I,V): I -> V
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            all_gather,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+        )
     # Validate src is V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_gather src must be V or S(i), got {src}")
@@ -194,10 +211,23 @@ class _ReduceScatter(torch.autograd.Function):
         ctx.scatter_dim = scatter_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        result = funcol.reduce_scatter_tensor(x, "sum", scatter_dim, pg).wait()
+        world_size = _dist.dist.get_world_size(pg)
         if stack:
-            return result.squeeze(scatter_dim)
-        return result
+            # x stacked on dim 0: shape[0] == world_size
+            result = x.new_empty([1] + list(x.shape[1:]))
+            _dist.dist.reduce_scatter_tensor(
+                result, x, op=_dist.dist.ReduceOp.SUM, group=pg
+            )
+            return result.squeeze(0)
+        else:
+            # x concatenated on dim 0: shape[0] == N * world_size
+            output_shape = list(x.shape)
+            output_shape[0] //= world_size
+            result = x.new_empty(output_shape)
+            _dist.dist.reduce_scatter_tensor(
+                result, x, op=_dist.dist.ReduceOp.SUM, group=pg
+            )
+            return result
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -208,7 +238,7 @@ class _ReduceScatter(torch.autograd.Function):
 
 def reduce_scatter(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType = V,
@@ -235,6 +265,16 @@ def reduce_scatter(
 
     The backward is all_gather(R): V -> R
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            reduce_scatter,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+            scatter_dim=scatter_dim,
+        )
     if src is not P:
         if src is V:
             x = reinterpret(x, axis, src=V, dst=P)
@@ -271,14 +311,14 @@ class _AllToAll(torch.autograd.Function):
         ctx.concat_dim = concat_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
         # Split input
         if stack:
             input_chunks = list(torch.unbind(x, dim=split_dim))
         else:
             input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
-        dist.all_to_all(output_chunks, input_chunks, group=pg)
+        _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
         if stack:
             return torch.stack(output_chunks, dim=concat_dim)
         return torch.cat(output_chunks, dim=concat_dim)
@@ -287,38 +327,27 @@ class _AllToAll(torch.autograd.Function):
     def backward(ctx, grad_out):
         # backward is also all_to_all (transpose back: swap src/dst and dims)
         if ctx.stack:
-            return (
-                all_to_all(
-                    grad_out,
-                    ctx.axis,
-                    src=V,
-                    dst=V,
-                    split_dim=ctx.concat_dim,
-                    concat_dim=ctx.split_dim,
-                ),
-                None,
-                None,
-                None,
-                None,
+            grad = all_to_all(
+                grad_out,
+                ctx.axis,
+                src=V,
+                dst=V,
+                split_dim=ctx.concat_dim,
+                concat_dim=ctx.split_dim,
             )
         else:
-            return (
-                all_to_all(
-                    grad_out,
-                    ctx.axis,
-                    src=Shard(ctx.concat_dim),
-                    dst=Shard(ctx.split_dim),
-                ),
-                None,
-                None,
-                None,
-                None,
+            grad = all_to_all(
+                grad_out,
+                ctx.axis,
+                src=Shard(ctx.concat_dim),
+                dst=Shard(ctx.split_dim),
             )
+        return grad, None, None, None, None
 
 
 def all_to_all(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType = V,
@@ -347,6 +376,17 @@ def all_to_all(
 
     The backward is also all_to_all: V -> V (with src/dst swapped)
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            all_to_all,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+            split_dim=split_dim,
+            concat_dim=concat_dim,
+        )
     # Validate src and dst are V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_to_all src must be V or S(i), got {src}")
@@ -369,7 +409,7 @@ def all_to_all(
 
 def redistribute(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -405,6 +445,16 @@ def redistribute(
     For conversions that don't require comms (R<->I, R->V, R->P, I->V, I->P, V->P),
     this function delegates to convert or reinterpret as appropriate.
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            redistribute,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+            dim=dim,
+        )
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim

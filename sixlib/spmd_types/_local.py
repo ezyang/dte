@@ -1,10 +1,7 @@
 """Local SPMD type coercion operations: reinterpret and convert."""
 
 import torch
-import torch.distributed as dist
-import torch.distributed._functional_collectives as funcol
-from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
-
+from sixlib.spmd_types import _dist
 from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
     I,
@@ -14,7 +11,9 @@ from sixlib.spmd_types.types import (
     Shard,
     V,
 )
-
+from torch.distributed import ProcessGroup
+from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
+from torch.overrides import handle_torch_function, has_torch_function_unary
 
 # =============================================================================
 # reinterpret autograd Functions
@@ -55,7 +54,7 @@ class _ReplicateToInvariant(torch.autograd.Function):
                 grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
             ), None
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(grad_out, rank), None
 
 
@@ -70,8 +69,9 @@ class _InvariantToReplicate(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_reduce(I): P -> I
-        pg = _get_mesh_axis_group(ctx.axis)
-        return funcol.all_reduce(grad_out, "sum", pg).wait(), None
+        from sixlib.spmd_types._collectives import all_reduce
+
+        return all_reduce(grad_out, ctx.axis, src=P, dst=I), None
 
 
 class _VaryingToPartial(torch.autograd.Function):
@@ -104,7 +104,7 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 def reinterpret(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -133,6 +133,15 @@ def reinterpret(
     Note: This API does not support S(i) for src/dst, because the restriction
     on no local tensor change means the semantics would be the same as V.
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            reinterpret,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+        )
     # Validate no Shard types
     if isinstance(src, Shard) or isinstance(dst, Shard):
         raise ValueError(
@@ -188,8 +197,8 @@ def _get_rank(pg):
     if mode is not None:
         # We're in LocalTensorMode - rank will be set by tensor_map callback
         # This function shouldn't be called directly in that case
-        return dist.get_rank(pg)
-    return dist.get_rank(pg)
+        return _dist.dist.get_rank(pg)
+    return _dist.dist.get_rank(pg)
 
 
 def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
@@ -242,7 +251,7 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
         ctx.split_dim = split_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
@@ -253,7 +262,7 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
                 ),
             )
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_varying_fwd(
                 x, world_size, split_dim, rank, stack=stack
             )
@@ -262,7 +271,7 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
     def backward(ctx, grad_out):
         # backward is convert(V,P): V -> P
         pg = _get_mesh_axis_group(ctx.axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
@@ -274,7 +283,7 @@ class _ConvertReplicateToVarying(torch.autograd.Function):
             )
             return result, None, None, None
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return (
                 _varying_to_partial_fwd(
                     grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack
@@ -294,7 +303,7 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
         ctx.split_dim = split_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
@@ -305,7 +314,7 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
                 ),
             )
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_varying_fwd(
                 x, world_size, split_dim, rank, stack=stack
             )
@@ -313,13 +322,10 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(I): V -> I
-        pg = _get_mesh_axis_group(ctx.axis)
-        world_size = dist.get_world_size(pg)
-        gathered = [torch.empty_like(grad_out) for _ in range(world_size)]
-        dist.all_gather(gathered, grad_out, group=pg)
-        if ctx.stack:
-            return torch.stack(gathered, dim=ctx.split_dim), None, None, None
-        return torch.cat(gathered, dim=ctx.split_dim), None, None, None
+        from sixlib.spmd_types._collectives import all_gather
+
+        src = V if ctx.stack else Shard(ctx.split_dim)
+        return all_gather(grad_out, ctx.axis, src=src, dst=I), None, None, None
 
 
 class _ConvertReplicateToPartial(torch.autograd.Function):
@@ -334,7 +340,7 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
         if mode is not None and isinstance(x, LocalTensor):
             return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(x, rank)
 
     @staticmethod
@@ -348,7 +354,7 @@ class _ConvertReplicateToPartial(torch.autograd.Function):
                 grad_out, lambda r, t: _replicate_to_partial_fwd(t, r)
             ), None
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(grad_out, rank), None
 
 
@@ -364,7 +370,7 @@ class _ConvertInvariantToPartial(torch.autograd.Function):
         if mode is not None and isinstance(x, LocalTensor):
             return mode.tensor_map(x, lambda r, t: _replicate_to_partial_fwd(t, r))
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _replicate_to_partial_fwd(x, rank)
 
     @staticmethod
@@ -382,7 +388,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
         ctx.split_dim = split_dim
         ctx.stack = stack
         pg = _get_mesh_axis_group(axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(x, LocalTensor):
@@ -393,14 +399,14 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
                 ),
             )
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return _varying_to_partial_fwd(x, world_size, split_dim, rank, stack=stack)
 
     @staticmethod
     def backward(ctx, grad_out):
         # backward is convert(R,V): R -> V (take local slice)
         pg = _get_mesh_axis_group(ctx.axis)
-        world_size = dist.get_world_size(pg)
+        world_size = _dist.dist.get_world_size(pg)
 
         mode = local_tensor_mode()
         if mode is not None and isinstance(grad_out, LocalTensor):
@@ -412,7 +418,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
             )
             return result, None, None, None
         else:
-            rank = dist.get_rank(pg)
+            rank = _dist.dist.get_rank(pg)
             return (
                 _replicate_to_varying_fwd(
                     grad_out, world_size, ctx.split_dim, rank, stack=ctx.stack
@@ -425,7 +431,7 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
 
 def convert(
     x,
-    axis: "str | dist.ProcessGroup",
+    axis: "str | ProcessGroup",
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
@@ -456,6 +462,16 @@ def convert(
         - convert(S(i),P): S(i) -> P, backward is convert(R,S(i)): R -> S(i)
         - convert(R,I) and convert(I,R) are same as reinterpret
     """
+    if has_torch_function_unary(x):
+        return handle_torch_function(
+            convert,
+            (x,),
+            x,
+            axis,
+            src=src,
+            dst=dst,
+            dim=dim,
+        )
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim
