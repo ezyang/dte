@@ -199,9 +199,5 @@ class PartitionSpec(tuple):
                 axes.add(s)
         return axes
 
-    def is_replicated(self) -> bool:
-        """Return True if all dimensions are replicated (no sharding)."""
-        return all(s is None for s in self)
-
 
 GlobalSpmdType = tuple[LocalSpmdType, PartitionSpec]

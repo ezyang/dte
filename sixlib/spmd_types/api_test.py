@@ -1,32 +1,53 @@
 """
-Tests for dte/_api.py local SPMD type system.
+Tests for SPMD type system.
 
 Uses PyTorch's LocalTensorMode to simulate distributed operations in a single
 process without requiring an actual distributed backend.
 """
 
 import unittest
+
 import torch
+import torch.distributed as dist
+from sixlib.spmd_types import (
+    all_gather,
+    all_reduce,
+    all_to_all,
+    convert,
+    get_mesh,
+    I,
+    Invariant,
+    P,
+    Partial,
+    PartitionSpec,
+    R,
+    redistribute,
+    reduce_scatter,
+    reinterpret,
+    Replicate,
+    S,
+    set_mesh,
+    Shard,
+    V,
+    Varying,
+)
+from sixlib.spmd_types._collectives import (
+    _AllReduce,
+)
+from sixlib.spmd_types._local import (
+    _ConvertInvariantToPartial,
+    _ConvertInvariantToVarying,
+    _ConvertReplicateToPartial,
+    _ConvertReplicateToVarying,
+    _ConvertVaryingToPartial,
+    _InvariantToReplicate,
+    _ReplicateToInvariant,
+    _ReplicateToPartial,
+    _ReplicateToVarying,
+    _VaryingToPartial,
+)
 from torch.distributed._local_tensor import LocalTensor, LocalTensorMode
 from torch.testing._internal.distributed.fake_pg import FakeStore
-import torch.distributed as dist
-
-from dte._api import (
-    LTensor,
-    einsum,
-    set_mesh,
-    get_mesh,
-    all_reduce,
-    all_gather,
-    reduce_scatter,
-    all_to_all,
-    reinterpret,
-    convert,
-    redistribute,
-    R, I, V, P, S,
-    Replicate, Invariant, Varying, Partial, Shard,
-    PartitionSpec,
-)
 
 
 class FakeMesh:
@@ -58,10 +79,7 @@ class LocalTensorTestCase(unittest.TestCase):
         if not dist.is_initialized():
             store = FakeStore()
             dist.init_process_group(
-                backend="fake",
-                rank=0,
-                world_size=cls.WORLD_SIZE,
-                store=store
+                backend="fake", rank=0, world_size=cls.WORLD_SIZE, store=store
             )
         # Set up the global mesh
         set_mesh(FakeMesh(cls.WORLD_SIZE))
@@ -89,7 +107,7 @@ class LocalTensorTestCase(unittest.TestCase):
         For replicate/invariant: same tensor on all ranks
         For varying/partial: different tensor per rank
         """
-        if src in ('replicate', 'invariant'):
+        if src in ("replicate", "invariant"):
             # Same tensor on all ranks
             base = torch.randn(shape)
             return self.mode.rank_map(lambda r: base.clone())
@@ -105,7 +123,7 @@ class LocalTensorTestCase(unittest.TestCase):
             torch.testing.assert_close(
                 tensors[ranks[0]],
                 tensors[ranks[i]],
-                msg=f"{msg}: rank 0 vs rank {ranks[i]}"
+                msg=f"{msg}: rank 0 vs rank {ranks[i]}",
             )
 
     def _assert_ranks_different(self, lt, msg=""):
@@ -118,7 +136,9 @@ class LocalTensorTestCase(unittest.TestCase):
         )
         self.assertFalse(all_same, f"{msg}: expected different values per rank")
 
-    def _check_backward_not_none(self, autograd_fn_class, forward_args, backward_grad_out):
+    def _check_backward_not_none(
+        self, autograd_fn_class, forward_args, backward_grad_out
+    ):
         """
         Verify that an autograd Function's backward returns valid gradients (not None).
 
@@ -133,9 +153,11 @@ class LocalTensorTestCase(unittest.TestCase):
         Returns:
             The result of the backward call
         """
+
         # Create a context object
         class FakeCtx:
             pass
+
         ctx = FakeCtx()
 
         # Run forward to populate ctx
@@ -150,7 +172,9 @@ class LocalTensorTestCase(unittest.TestCase):
         else:
             grad_input = result
 
-        self.assertIsNotNone(grad_input, f"{autograd_fn_class.__name__}.backward returned None")
+        self.assertIsNotNone(
+            grad_input, f"{autograd_fn_class.__name__}.backward returned None"
+        )
 
         # Also verify it's a proper tensor/LocalTensor with the right shape
         if isinstance(backward_grad_out, LocalTensor):
@@ -161,146 +185,14 @@ class LocalTensorTestCase(unittest.TestCase):
         return result
 
 
-class TestLTensorCreation(unittest.TestCase):
-    """Test LTensor creation and validation (no LocalTensorMode needed)."""
-
-    def test_ltensor_creation_valid(self):
-        """Test creating LTensor with valid types."""
-        data = torch.randn(4, 4)
-        types = {'tp': R, 'dp': V}
-        lt = LTensor(data, types)
-        self.assertEqual(lt.get_type('tp'), R)
-        self.assertEqual(lt.get_type('dp'), V)
-        self.assertIsNone(lt.get_type('nonexistent'))
-
-    def test_ltensor_creation_all_types(self):
-        """Test creating LTensor with all valid types."""
-        data = torch.randn(4)
-        for typ in [R, I, V, P]:
-            lt = LTensor(data, {'axis': typ})
-            self.assertEqual(lt.get_type('axis'), typ)
-
-    def test_ltensor_creation_with_shard(self):
-        """Test creating LTensor with Shard type."""
-        data = torch.randn(4, 8)
-        lt = LTensor(data, {'tp': S(1)})
-        self.assertEqual(lt.get_type('tp'), S(1))
-        self.assertIsInstance(lt.get_type('tp'), Shard)
-
-    def test_ltensor_creation_invalid_type(self):
-        """Test that invalid types raise TypeError."""
-        data = torch.randn(4)
-        with self.assertRaises(TypeError) as ctx:
-            LTensor(data, {'tp': 'invalid'})
-        self.assertIn("Invalid type", str(ctx.exception))
-
-    def test_ltensor_with_type(self):
-        """Test LTensor.with_type method."""
-        data = torch.randn(4)
-        lt = LTensor(data, {'tp': R})
-        lt2 = lt.with_type('tp', V)
-        # Original unchanged
-        self.assertEqual(lt.get_type('tp'), R)
-        # New one updated
-        self.assertEqual(lt2.get_type('tp'), V)
-
-    def test_ltensor_with_type_shard(self):
-        """Test LTensor.with_type with Shard type."""
-        data = torch.randn(4, 8)
-        lt = LTensor(data, {'tp': R})
-        lt2 = lt.with_type('tp', S(0))
-        self.assertEqual(lt2.get_type('tp'), S(0))
-
-    def test_ltensor_with_type_invalid(self):
-        """Test LTensor.with_type rejects invalid types."""
-        data = torch.randn(4)
-        lt = LTensor(data, {'tp': R})
-        with self.assertRaises(TypeError):
-            lt.with_type('tp', 'bad_type')
-
-
 class TestEinsumTypePropagation(unittest.TestCase):
-    """Test einsum type propagation rules (no LocalTensorMode needed)."""
+    """Test einsum type propagation rules.
 
-    def _make_ltensor(self, shape, types):
-        """Helper to create LTensor with given types."""
-        return LTensor(torch.randn(*shape), types)
+    TODO: These tests depend on LTensor which was removed. They need to be
+    reimplemented once the type-checking layer is rebuilt.
+    """
 
-    def test_einsum_all_replicate(self):
-        """All replicate inputs -> replicate output."""
-        a = self._make_ltensor((2, 3), {'tp': R})
-        b = self._make_ltensor((3, 4), {'tp': R})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.get_type('tp'), R)
-
-    def test_einsum_all_invariant(self):
-        """All invariant inputs -> invariant output."""
-        a = self._make_ltensor((2, 3), {'tp': I})
-        b = self._make_ltensor((3, 4), {'tp': I})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.get_type('tp'), I)
-
-    def test_einsum_all_varying(self):
-        """All varying inputs -> varying output."""
-        a = self._make_ltensor((2, 3), {'tp': V})
-        b = self._make_ltensor((3, 4), {'tp': V})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.get_type('tp'), V)
-
-    def test_einsum_all_partial(self):
-        """All partial inputs -> partial output (for linear ops)."""
-        a = self._make_ltensor((2, 3), {'tp': P})
-        b = self._make_ltensor((3, 4), {'tp': P})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.get_type('tp'), P)
-
-    def test_einsum_mixed_replicate_varying(self):
-        """Mixed replicate/varying -> varying output."""
-        a = self._make_ltensor((2, 3), {'tp': R})
-        b = self._make_ltensor((3, 4), {'tp': V})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.get_type('tp'), V)
-
-    def test_einsum_invariant_mixing_error(self):
-        """Invariant cannot mix with other types."""
-        a = self._make_ltensor((2, 3), {'tp': I})
-        b = self._make_ltensor((3, 4), {'tp': R})
-        with self.assertRaises(TypeError) as ctx:
-            einsum('ij,jk->ik', a, b)
-        self.assertIn("Invariant type", str(ctx.exception))
-        self.assertIn("cannot mix", str(ctx.exception))
-
-    def test_einsum_invariant_varying_error(self):
-        """Invariant cannot mix with varying."""
-        a = self._make_ltensor((2, 3), {'tp': I})
-        b = self._make_ltensor((3, 4), {'tp': V})
-        with self.assertRaises(TypeError):
-            einsum('ij,jk->ik', a, b)
-
-    def test_einsum_partial_replicate_error(self):
-        """Partial cannot mix with replicate."""
-        a = self._make_ltensor((2, 3), {'tp': P})
-        b = self._make_ltensor((3, 4), {'tp': R})
-        with self.assertRaises(TypeError) as ctx:
-            einsum('ij,jk->ik', a, b)
-        self.assertIn("Partial type", str(ctx.exception))
-
-    def test_einsum_multi_axis(self):
-        """Test type propagation across multiple mesh axes."""
-        a = self._make_ltensor((2, 3), {'tp': R, 'dp': V})
-        b = self._make_ltensor((3, 4), {'tp': V, 'dp': R})
-        result = einsum('ij,jk->ik', a, b)
-        # tp: replicate + varying -> varying
-        self.assertEqual(result.get_type('tp'), V)
-        # dp: varying + replicate -> varying
-        self.assertEqual(result.get_type('dp'), V)
-
-    def test_einsum_out_partial_axes(self):
-        """Test out_partial_axes for marking output as partial."""
-        a = self._make_ltensor((2, 3), {'tp': V})
-        b = self._make_ltensor((3, 4), {'tp': V})
-        result = einsum('ij,jk->ik', a, b, out_partial_axes={'tp'})
-        self.assertEqual(result.get_type('tp'), P)
+    pass
 
 
 class TestAllReduce(LocalTensorTestCase):
@@ -308,57 +200,107 @@ class TestAllReduce(LocalTensorTestCase):
 
     def test_all_reduce_p_to_r(self):
         """all_reduce(R): P -> R, sums across ranks. Tests forward and backward."""
-        from dte._api import _AllReduceToReplicate
-
         # Create "partial" input - different values per rank that need summing
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
 
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
         # Run all_reduce
-        result = all_reduce(x, 'tp', src=P, dst=R)
+        result = all_reduce(x, "tp", src=P, dst=R)
 
         # Check all ranks have the same summed value
-        self._assert_all_ranks_equal(result, "all_reduce result should be same on all ranks")
+        self._assert_all_ranks_equal(
+            result, "all_reduce result should be same on all ranks"
+        )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
 
         # Backward check: verify backward returns valid gradient
-        grad_out = self._generate_inputs((4,), 'partial')
-        self._check_backward_not_none(_AllReduceToReplicate, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "partial")
+        self._check_backward_not_none(_AllReduce, (x, "tp", R, False), grad_out)
 
     def test_all_reduce_p_to_i(self):
         """all_reduce(I): P -> I, sums across ranks. Tests forward and backward."""
-        from dte._api import _AllReduceToInvariant
-
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
         # Get expected sum before all_reduce modifies x in-place
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        result = all_reduce(x, 'tp', src=P, dst=I)
+        result = all_reduce(x, "tp", src=P, dst=I)
 
-        self._assert_all_ranks_equal(result, "all_reduce result should be same on all ranks")
+        self._assert_all_ranks_equal(
+            result, "all_reduce result should be same on all ranks"
+        )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected_sum)
 
         # Backward check: verify backward returns valid gradient
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_AllReduceToInvariant, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "replicate")
+        self._check_backward_not_none(_AllReduce, (x, "tp", I, False), grad_out)
 
     def test_all_reduce_invalid_src(self):
         """all_reduce only accepts partial src."""
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         with self.assertRaises(ValueError) as ctx:
-            all_reduce(x, 'tp', src=R, dst=R)
+            all_reduce(x, "tp", src=R, dst=R)
         self.assertIn("must be P", str(ctx.exception))
 
     def test_all_reduce_invalid_dst(self):
         """all_reduce only accepts replicate or invariant dst."""
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
         with self.assertRaises(ValueError) as ctx:
-            all_reduce(x, 'tp', src=P, dst=V)
+            all_reduce(x, "tp", src=P, dst=V)
         self.assertIn("must be R or I", str(ctx.exception))
+
+    def test_all_reduce_p_to_r_inplace(self):
+        """all_reduce(R, inplace=True): P -> R in-place. Result shares storage with input."""
+        x = self._generate_inputs((4,), "partial")
+        expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
+
+        # Save data pointers before
+        input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
+
+        result = all_reduce(x, "tp", src=P, dst=R, inplace=True)
+
+        # Check correctness
+        self._assert_all_ranks_equal(
+            result, "all_reduce inplace result should be same on all ranks"
+        )
+        for r in range(self.WORLD_SIZE):
+            torch.testing.assert_close(result._local_tensors[r], expected_sum)
+
+        # Check in-place: returned tensor shares storage with input
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(
+                result._local_tensors[r].data_ptr(),
+                input_ptrs[r],
+                f"rank {r}: inplace result should share storage with input",
+            )
+
+    def test_all_reduce_p_to_i_inplace(self):
+        """all_reduce(I, inplace=True): P -> I in-place. Result shares storage with input."""
+        x = self._generate_inputs((4,), "partial")
+        expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
+
+        # Save data pointers before
+        input_ptrs = {r: x._local_tensors[r].data_ptr() for r in range(self.WORLD_SIZE)}
+
+        result = all_reduce(x, "tp", src=P, dst=I, inplace=True)
+
+        # Check correctness
+        self._assert_all_ranks_equal(
+            result, "all_reduce inplace result should be same on all ranks"
+        )
+        for r in range(self.WORLD_SIZE):
+            torch.testing.assert_close(result._local_tensors[r], expected_sum)
+
+        # Check in-place: returned tensor shares storage with input
+        for r in range(self.WORLD_SIZE):
+            self.assertEqual(
+                result._local_tensors[r].data_ptr(),
+                input_ptrs[r],
+                f"rank {r}: inplace result should share storage with input",
+            )
 
 
 class TestAllGather(LocalTensorTestCase):
@@ -369,7 +311,7 @@ class TestAllGather(LocalTensorTestCase):
         # Create varying input - different per rank
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
-        result = all_gather(x, 'tp', src=V, dst=R, gather_dim=0)
+        result = all_gather(x, "tp", src=V, dst=R)
 
         # Result should be [0, 1, 2] on all ranks (stack)
         expected = torch.tensor([0.0, 1.0, 2.0])
@@ -381,7 +323,7 @@ class TestAllGather(LocalTensorTestCase):
         """all_gather(I): V -> I, gathers shards from all ranks."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r) * 2))
 
-        result = all_gather(x, 'tp', src=V, dst=I, gather_dim=0)
+        result = all_gather(x, "tp", src=V, dst=I)
 
         expected = torch.tensor([0.0, 2.0, 4.0])
         self._assert_all_ranks_equal(result)
@@ -393,7 +335,7 @@ class TestAllGather(LocalTensorTestCase):
         # Create sharded input on dim 0
         x = self.mode.rank_map(lambda r: torch.tensor([float(r), float(r) + 0.5]))
 
-        result = all_gather(x, 'tp', src=S(0), dst=R, gather_dim=1)
+        result = all_gather(x, "tp", src=S(0), dst=R)
 
         # Result should be concatenated shards
         expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 2.5])
@@ -403,16 +345,16 @@ class TestAllGather(LocalTensorTestCase):
 
     def test_all_gather_invalid_src(self):
         """all_gather only accepts V or S(i) src."""
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         with self.assertRaises(ValueError) as ctx:
-            all_gather(x, 'tp', src=R, dst=R)
+            all_gather(x, "tp", src=R, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
     def test_all_gather_invalid_dst(self):
         """all_gather only accepts replicate or invariant dst."""
-        x = self._generate_inputs((4,), 'varying')
+        x = self._generate_inputs((4,), "varying")
         with self.assertRaises(ValueError) as ctx:
-            all_gather(x, 'tp', src=V, dst=P)
+            all_gather(x, "tp", src=V, dst=P)
         self.assertIn("must be R or I", str(ctx.exception))
 
 
@@ -425,10 +367,13 @@ class TestReduceScatter(LocalTensorTestCase):
         # Each rank has [A_r, B_r, C_r] where total length is world_size * chunk_size
         chunk_size = 2
         x = self.mode.rank_map(
-            lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float).reshape(self.WORLD_SIZE, chunk_size) + r
+            lambda r: torch.arange(
+                self.WORLD_SIZE * chunk_size, dtype=torch.float
+            ).reshape(self.WORLD_SIZE, chunk_size)
+            + r
         )
 
-        result = reduce_scatter(x, 'tp', src=P, dst=V, scatter_dim=0)
+        result = reduce_scatter(x, "tp", src=P, dst=V, scatter_dim=0)
 
         # Each rank r gets the sum of chunk r from all ranks
         for r in range(self.WORLD_SIZE):
@@ -436,9 +381,7 @@ class TestReduceScatter(LocalTensorTestCase):
             for src_rank in range(self.WORLD_SIZE):
                 expected += x._local_tensors[src_rank][r]
             torch.testing.assert_close(
-                result._local_tensors[r],
-                expected,
-                msg=f"rank {r}"
+                result._local_tensors[r], expected, msg=f"rank {r}"
             )
 
     def test_reduce_scatter_to_shard(self):
@@ -448,7 +391,7 @@ class TestReduceScatter(LocalTensorTestCase):
             lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
         )
 
-        result = reduce_scatter(x, 'tp', src=P, dst=S(0), scatter_dim=1)
+        result = reduce_scatter(x, "tp", src=P, dst=S(0), scatter_dim=1)
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -457,23 +400,21 @@ class TestReduceScatter(LocalTensorTestCase):
                 chunk_end = (r + 1) * chunk_size
                 expected += x._local_tensors[src_rank][chunk_start:chunk_end]
             torch.testing.assert_close(
-                result._local_tensors[r],
-                expected,
-                msg=f"rank {r}"
+                result._local_tensors[r], expected, msg=f"rank {r}"
             )
 
     def test_reduce_scatter_invalid_src(self):
-        """reduce_scatter only accepts P src."""
-        x = self._generate_inputs((6,), 'varying')
+        """reduce_scatter only accepts P (or V, which is auto-reinterpreted) src."""
+        x = self._generate_inputs((6,), "replicate")
         with self.assertRaises(ValueError) as ctx:
-            reduce_scatter(x, 'tp', src=V, dst=V)
+            reduce_scatter(x, "tp", src=R, dst=V)
         self.assertIn("must be P", str(ctx.exception))
 
     def test_reduce_scatter_invalid_dst(self):
         """reduce_scatter only accepts V or S(i) dst."""
-        x = self._generate_inputs((6,), 'partial')
+        x = self._generate_inputs((6,), "partial")
         with self.assertRaises(ValueError) as ctx:
-            reduce_scatter(x, 'tp', src=P, dst=R)
+            reduce_scatter(x, "tp", src=P, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
 
@@ -484,21 +425,27 @@ class TestAllToAll(LocalTensorTestCase):
         """all_to_all: V -> V, transposes mesh and tensor dims."""
         # Create input: rank r has [r*3, r*3+1, r*3+2]
         # After all_to_all, rank r should get [r, r+3, r+6]
-        x = self.mode.rank_map(lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)]))
+        x = self.mode.rank_map(
+            lambda r: torch.tensor([float(r * 3 + i) for i in range(self.WORLD_SIZE)])
+        )
 
-        result = all_to_all(x, 'tp', src=V, dst=V, split_dim=0, concat_dim=0)
+        result = all_to_all(x, "tp", src=V, dst=V, split_dim=0, concat_dim=0)
 
         # Check result
         for r in range(self.WORLD_SIZE):
             expected = torch.tensor([float(r + i * 3) for i in range(self.WORLD_SIZE)])
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_all_to_all_shard_to_shard(self):
         """all_to_all: S(i) -> S(j), resharding between dimensions."""
         # Each rank has a 2D tensor
-        x = self.mode.rank_map(lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+        )
 
-        result = all_to_all(x, 'tp', src=S(0), dst=S(1), split_dim=1, concat_dim=0)
+        result = all_to_all(x, "tp", src=S(0), dst=S(1), split_dim=1, concat_dim=0)
 
         # Check shapes are correct
         for r in range(self.WORLD_SIZE):
@@ -507,16 +454,16 @@ class TestAllToAll(LocalTensorTestCase):
 
     def test_all_to_all_invalid_src(self):
         """all_to_all only accepts V or S(i) src."""
-        x = self._generate_inputs((6,), 'replicate')
+        x = self._generate_inputs((6,), "replicate")
         with self.assertRaises(ValueError) as ctx:
-            all_to_all(x, 'tp', src=R, dst=V)
+            all_to_all(x, "tp", src=R, dst=V)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
     def test_all_to_all_invalid_dst(self):
         """all_to_all only accepts V or S(i) dst."""
-        x = self._generate_inputs((6,), 'varying')
+        x = self._generate_inputs((6,), "varying")
         with self.assertRaises(ValueError) as ctx:
-            all_to_all(x, 'tp', src=V, dst=R)
+            all_to_all(x, "tp", src=V, dst=R)
         self.assertIn("must be V or S(i)", str(ctx.exception))
 
 
@@ -525,104 +472,94 @@ class TestReinterpret(LocalTensorTestCase):
 
     def test_reinterpret_r_to_v(self):
         """reinterpret(R,V): R -> V, no-op forward. Tests forward and backward."""
-        from dte._api import _ReplicateToVarying
-
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=R, dst=V)
+        result = reinterpret(x, "tp", src=R, dst=V)
 
         # Forward is no-op, values unchanged
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
         # Backward check
-        grad_out = self._generate_inputs((4,), 'varying')
-        self._check_backward_not_none(_ReplicateToVarying, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "varying")
+        self._check_backward_not_none(_ReplicateToVarying, (x, "tp"), grad_out)
 
     def test_reinterpret_r_to_i(self):
         """reinterpret(R,I): R -> I, no-op forward. Tests forward and backward."""
-        from dte._api import _ReplicateToInvariant
-
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=R, dst=I)
+        result = reinterpret(x, "tp", src=R, dst=I)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
         # Backward check
-        grad_out = self._generate_inputs((4,), 'invariant')
-        self._check_backward_not_none(_ReplicateToInvariant, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "invariant")
+        self._check_backward_not_none(_ReplicateToInvariant, (x, "tp"), grad_out)
 
     def test_reinterpret_r_to_p(self):
         """reinterpret(R,P): R -> P, no-op forward. Tests forward and backward."""
-        from dte._api import _ReplicateToPartial
-
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=R, dst=P)
+        result = reinterpret(x, "tp", src=R, dst=P)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
         # Backward check
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_ReplicateToPartial, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "replicate")
+        self._check_backward_not_none(_ReplicateToPartial, (x, "tp"), grad_out)
 
     def test_reinterpret_i_to_r(self):
         """reinterpret(I,R): I -> R, no-op forward. Tests forward and backward."""
-        from dte._api import _InvariantToReplicate
-
-        x = self._generate_inputs((4,), 'invariant')
+        x = self._generate_inputs((4,), "invariant")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=I, dst=R)
+        result = reinterpret(x, "tp", src=I, dst=R)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
         # Backward check
-        grad_out = self._generate_inputs((4,), 'partial')
-        self._check_backward_not_none(_InvariantToReplicate, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "partial")
+        self._check_backward_not_none(_InvariantToReplicate, (x, "tp"), grad_out)
 
     def test_reinterpret_v_to_p(self):
         """reinterpret(V,P): V -> P, no-op forward. Tests forward and backward."""
-        from dte._api import _VaryingToPartial
-
-        x = self._generate_inputs((4,), 'varying')
+        x = self._generate_inputs((4,), "varying")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=V, dst=P)
+        result = reinterpret(x, "tp", src=V, dst=P)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
         # Backward check
-        grad_out = self._generate_inputs((4,), 'replicate')
-        self._check_backward_not_none(_VaryingToPartial, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((4,), "replicate")
+        self._check_backward_not_none(_VaryingToPartial, (x, "tp"), grad_out)
 
     def test_reinterpret_same_type_noop(self):
         """reinterpret with same src and dst is identity."""
-        x = self._generate_inputs((4,), 'replicate')
-        result = reinterpret(x, 'tp', src=R, dst=R)
+        x = self._generate_inputs((4,), "replicate")
+        result = reinterpret(x, "tp", src=R, dst=R)
         # Should return same tensor
         self.assertIs(result, x)
 
     def test_reinterpret_shard_rejected(self):
         """reinterpret rejects Shard types."""
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         with self.assertRaises(ValueError) as ctx:
-            reinterpret(x, 'tp', src=R, dst=S(0))
+            reinterpret(x, "tp", src=R, dst=S(0))
         self.assertIn("does not support S(i)", str(ctx.exception))
 
     def test_reinterpret_unsupported_transition(self):
         """reinterpret rejects unsupported transitions."""
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
         with self.assertRaises(ValueError) as ctx:
-            reinterpret(x, 'tp', src=P, dst=R)
+            reinterpret(x, "tp", src=P, dst=R)
         self.assertIn("not supported", str(ctx.exception))
 
 
@@ -631,70 +568,76 @@ class TestConvert(LocalTensorTestCase):
 
     def test_convert_r_to_v(self):
         """convert(R,V): R -> V, slices to local portion. Tests forward and backward."""
-        from dte._api import _ConvertReplicateToVarying
-
         # Create replicated input shaped for stack semantics
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=R, dst=V, dim=0)
+        result = convert(x, "tp", src=R, dst=V, dim=0)
 
         # Each rank gets its chunk: rank 0 gets [0,1], rank 1 gets [2,3], rank 2 gets [4,5]
         for r in range(self.WORLD_SIZE):
             expected = base[r]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
         # Backward check
-        grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertReplicateToVarying, (x, 'tp', 0, True), grad_out)
+        grad_out = self._generate_inputs((2,), "varying")
+        self._check_backward_not_none(
+            _ConvertReplicateToVarying, (x, "tp", 0, True), grad_out
+        )
 
     def test_convert_r_to_shard(self):
         """convert(R,S(i)): R -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=R, dst=S(0), dim=0)
+        result = convert(x, "tp", src=R, dst=S(0), dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            expected = base[r * 2 : (r + 1) * 2]
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_convert_i_to_v(self):
         """convert(I,V): I -> V, slices to local portion. Tests forward and backward."""
-        from dte._api import _ConvertInvariantToVarying
-
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=I, dst=V, dim=0)
+        result = convert(x, "tp", src=I, dst=V, dim=0)
 
         for r in range(self.WORLD_SIZE):
             expected = base[r]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
         # Backward check
-        grad_out = self._generate_inputs((2,), 'varying')
-        self._check_backward_not_none(_ConvertInvariantToVarying, (x, 'tp', 0, True), grad_out)
+        grad_out = self._generate_inputs((2,), "varying")
+        self._check_backward_not_none(
+            _ConvertInvariantToVarying, (x, "tp", 0, True), grad_out
+        )
 
     def test_convert_i_to_shard(self):
         """convert(I,S(i)): I -> S(i), slices to local portion."""
         base = torch.arange(6, dtype=torch.float)
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=I, dst=S(0), dim=0)
+        result = convert(x, "tp", src=I, dst=S(0), dim=0)
 
         for r in range(self.WORLD_SIZE):
-            expected = base[r * 2:(r + 1) * 2]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            expected = base[r * 2 : (r + 1) * 2]
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_convert_r_to_p(self):
         """convert(R,P): R -> P, zeros out non-rank-0. Tests forward and backward."""
-        from dte._api import _ConvertReplicateToPartial
-
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=R, dst=P)
+        result = convert(x, "tp", src=R, dst=P)
 
         # Rank 0 keeps values, others are zeroed
         torch.testing.assert_close(result._local_tensors[0], base)
@@ -702,95 +645,97 @@ class TestConvert(LocalTensorTestCase):
             torch.testing.assert_close(
                 result._local_tensors[r],
                 torch.zeros_like(base),
-                msg=f"rank {r} should be zeros"
+                msg=f"rank {r} should be zeros",
             )
 
         # Backward check
-        grad_out = self._generate_inputs((3,), 'replicate')
-        self._check_backward_not_none(_ConvertReplicateToPartial, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((3,), "replicate")
+        self._check_backward_not_none(_ConvertReplicateToPartial, (x, "tp"), grad_out)
 
     def test_convert_i_to_p(self):
         """convert(I,P): I -> P, zeros out non-rank-0. Tests forward and backward."""
-        from dte._api import _ConvertInvariantToPartial
-
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = convert(x, 'tp', src=I, dst=P)
+        result = convert(x, "tp", src=I, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
             torch.testing.assert_close(
                 result._local_tensors[r],
                 torch.zeros_like(base),
-                msg=f"rank {r} should be zeros"
+                msg=f"rank {r} should be zeros",
             )
 
         # Backward check
-        grad_out = self._generate_inputs((3,), 'invariant')
-        self._check_backward_not_none(_ConvertInvariantToPartial, (x, 'tp'), grad_out)
+        grad_out = self._generate_inputs((3,), "invariant")
+        self._check_backward_not_none(_ConvertInvariantToPartial, (x, "tp"), grad_out)
 
     def test_convert_v_to_p(self):
         """convert(V,P): V -> P, places data in disjoint positions. Tests forward and backward."""
-        from dte._api import _ConvertVaryingToPartial
-
         # Each rank has [r]
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
-        result = convert(x, 'tp', src=V, dst=P, dim=0)
+        result = convert(x, "tp", src=V, dst=P, dim=0)
 
         # Each rank has a tensor of size world_size with its value at its position
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(self.WORLD_SIZE)
             expected[r] = float(r)
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
         # Backward check
-        grad_out = self._generate_inputs((self.WORLD_SIZE,), 'replicate')
-        self._check_backward_not_none(_ConvertVaryingToPartial, (x, 'tp', 0, True), grad_out)
+        grad_out = self._generate_inputs((self.WORLD_SIZE,), "replicate")
+        self._check_backward_not_none(
+            _ConvertVaryingToPartial, (x, "tp", 0, True), grad_out
+        )
 
     def test_convert_shard_to_p(self):
         """convert(S(i),P): S(i) -> P, places data in disjoint positions."""
         x = self.mode.rank_map(lambda r: torch.tensor([float(r)]))
 
-        result = convert(x, 'tp', src=S(0), dst=P, dim=0)
+        result = convert(x, "tp", src=S(0), dst=P, dim=0)
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(self.WORLD_SIZE)
             expected[r] = float(r)
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_convert_same_type_noop(self):
         """convert with same src and dst is identity."""
-        x = self._generate_inputs((4,), 'replicate')
-        result = convert(x, 'tp', src=R, dst=R)
+        x = self._generate_inputs((4,), "replicate")
+        result = convert(x, "tp", src=R, dst=R)
         self.assertIs(result, x)
 
     def test_convert_r_to_i_same_as_reinterpret(self):
         """convert(R,I) should work like reinterpret(R,I)."""
-        x = self._generate_inputs((4,), 'replicate')
+        x = self._generate_inputs((4,), "replicate")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = convert(x, 'tp', src=R, dst=I)
+        result = convert(x, "tp", src=R, dst=I)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
     def test_convert_i_to_r_same_as_reinterpret(self):
         """convert(I,R) should work like reinterpret(I,R)."""
-        x = self._generate_inputs((4,), 'invariant')
+        x = self._generate_inputs((4,), "invariant")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = convert(x, 'tp', src=I, dst=R)
+        result = convert(x, "tp", src=I, dst=R)
 
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], original[r])
 
     def test_convert_from_partial_error(self):
         """convert cannot convert from partial."""
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
         with self.assertRaises(ValueError) as ctx:
-            convert(x, 'tp', src=P, dst=R)
+            convert(x, "tp", src=P, dst=R)
         self.assertIn("not supported", str(ctx.exception))
 
 
@@ -814,10 +759,10 @@ class TestReinterpretCompositions(LocalTensorTestCase):
 
     def test_reinterpret_i_to_v(self):
         """reinterpret(I,V): I -> R -> V composition, no-op forward."""
-        x = self._generate_inputs((4,), 'invariant')
+        x = self._generate_inputs((4,), "invariant")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=I, dst=V)
+        result = reinterpret(x, "tp", src=I, dst=V)
 
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
@@ -825,10 +770,10 @@ class TestReinterpretCompositions(LocalTensorTestCase):
 
     def test_reinterpret_i_to_p(self):
         """reinterpret(I,P): I -> R -> P composition, no-op forward."""
-        x = self._generate_inputs((4,), 'invariant')
+        x = self._generate_inputs((4,), "invariant")
         original = {r: x._local_tensors[r].clone() for r in range(self.WORLD_SIZE)}
 
-        result = reinterpret(x, 'tp', src=I, dst=P)
+        result = reinterpret(x, "tp", src=I, dst=P)
 
         # Forward is no-op (composition of two no-ops)
         for r in range(self.WORLD_SIZE):
@@ -839,16 +784,14 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
     """Test all_gather with different gather dimensions."""
 
     def test_all_gather_dim_1(self):
-        """all_gather with gather_dim=1."""
+        """all_gather with S(1) concatenates on dim 1."""
         # Each rank has shape (2, 1)
         x = self.mode.rank_map(lambda r: torch.tensor([[float(r)], [float(r + 10)]]))
 
-        result = all_gather(x, 'tp', src=V, dst=R, gather_dim=1)
+        result = all_gather(x, "tp", src=S(1), dst=R)
 
-        # Result should have shape (2, 3, 1) on all ranks
-        expected = torch.tensor(
-            [[[0.0], [1.0], [2.0]], [[10.0], [11.0], [12.0]]]
-        )
+        # Result should have shape (2, 3) on all ranks (cat along dim 1)
+        expected = torch.tensor([[0.0, 1.0, 2.0], [10.0, 11.0, 12.0]])
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
@@ -858,10 +801,12 @@ class TestAllGatherMultiDim(LocalTensorTestCase):
         # Each rank has a 2x2 matrix
         x = self.mode.rank_map(lambda r: torch.full((2, 2), float(r)))
 
-        result = all_gather(x, 'tp', src=V, dst=R, gather_dim=0)
+        result = all_gather(x, "tp", src=V, dst=R)
 
         # Result should be (3, 2, 2) - stack along dim 0
-        expected = torch.stack([torch.full((2, 2), float(r)) for r in range(self.WORLD_SIZE)], dim=0)
+        expected = torch.stack(
+            [torch.full((2, 2), float(r)) for r in range(self.WORLD_SIZE)], dim=0
+        )
         for r in range(self.WORLD_SIZE):
             torch.testing.assert_close(result._local_tensors[r], expected)
 
@@ -872,9 +817,11 @@ class TestAllToAllMultiDim(LocalTensorTestCase):
     def test_all_to_all_2d_same_dims(self):
         """all_to_all with 2D tensors, split and concat on same dim."""
         # Each rank has shape (3, 2) - split on dim 0
-        x = self.mode.rank_map(lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+        )
 
-        result = all_to_all(x, 'tp', split_dim=0, concat_dim=0)
+        result = all_to_all(x, "tp", split_dim=0, concat_dim=0)
 
         # After all_to_all:
         # Rank 0 gets [0th row from rank 0, 0th row from rank 1, 0th row from rank 2]
@@ -884,63 +831,14 @@ class TestAllToAllMultiDim(LocalTensorTestCase):
             self.assertEqual(result_tensor.shape, (3, 2))
 
 
-class TestLTensorNoTypes(unittest.TestCase):
-    """Test LTensor with no type annotations."""
-
-    def test_ltensor_empty_types(self):
-        """LTensor with empty types dict."""
-        data = torch.randn(4)
-        lt = LTensor(data, {})
-        self.assertEqual(lt.types, {})
-        self.assertIsNone(lt.get_type('any_axis'))
-
-    def test_ltensor_none_types(self):
-        """LTensor with None types (default)."""
-        data = torch.randn(4)
-        lt = LTensor(data)
-        self.assertEqual(lt.types, {})
-
-    def test_einsum_with_no_types(self):
-        """einsum with operands that have no type annotations."""
-        a = LTensor(torch.randn(2, 3), {})
-        b = LTensor(torch.randn(3, 4), {})
-        result = einsum('ij,jk->ik', a, b)
-        self.assertEqual(result.types, {})
-
-    def test_einsum_partial_types(self):
-        """einsum where only some operands have type annotations."""
-        a = LTensor(torch.randn(2, 3), {'tp': R})
-        b = LTensor(torch.randn(3, 4), {})  # No types
-        result = einsum('ij,jk->ik', a, b)
-        # The type is inherited from the one operand that has it
-        self.assertEqual(result.get_type('tp'), R)
-
-
 class TestEinsumSingleOperand(unittest.TestCase):
-    """Test einsum with single operand (unary operations)."""
+    """Test einsum with single operand (unary operations).
 
-    def _make_ltensor(self, shape, types):
-        return LTensor(torch.randn(*shape), types)
+    TODO: These tests depend on LTensor which was removed. They need to be
+    reimplemented once the type-checking layer is rebuilt.
+    """
 
-    def test_einsum_trace(self):
-        """einsum trace operation: ii->"""
-        a = self._make_ltensor((3, 3), {'tp': R})
-        result = einsum('ii->', a)
-        self.assertEqual(result.get_type('tp'), R)
-        self.assertEqual(result.data.shape, ())
-
-    def test_einsum_transpose(self):
-        """einsum transpose operation: ij->ji"""
-        a = self._make_ltensor((2, 3), {'tp': V})
-        result = einsum('ij->ji', a)
-        self.assertEqual(result.get_type('tp'), V)
-        self.assertEqual(result.data.shape, (3, 2))
-
-    def test_einsum_sum_reduction(self):
-        """einsum sum reduction: ij->"""
-        a = self._make_ltensor((2, 3), {'tp': P})
-        result = einsum('ij->', a)
-        self.assertEqual(result.get_type('tp'), P)
+    pass
 
 
 class TestTypeSingletons(unittest.TestCase):
@@ -1017,46 +915,39 @@ class TestPartitionSpec(unittest.TestCase):
         """Empty partition spec is fully replicated."""
         ps = PartitionSpec()
         self.assertEqual(len(ps), 0)
-        self.assertTrue(ps.is_replicated())
         self.assertEqual(ps.get_mesh_axes(), set())
 
     def test_single_axis_partition_spec(self):
         """Partition spec with single mesh axis."""
-        ps = PartitionSpec('tp', None)
+        ps = PartitionSpec("tp", None)
         self.assertEqual(len(ps), 2)
-        self.assertFalse(ps.is_replicated())
-        self.assertEqual(ps.get_mesh_axes(), {'tp'})
-        self.assertEqual(ps[0], 'tp')
+        self.assertEqual(ps.get_mesh_axes(), {"tp"})
+        self.assertEqual(ps[0], "tp")
         self.assertIsNone(ps[1])
 
     def test_multi_axis_partition_spec(self):
         """Partition spec with multiple mesh axes on same dim."""
-        ps = PartitionSpec(('dp', 'tp'), None)
+        ps = PartitionSpec(("dp", "tp"), None)
         self.assertEqual(len(ps), 2)
-        self.assertEqual(ps.get_mesh_axes(), {'dp', 'tp'})
-        self.assertEqual(ps[0], ('dp', 'tp'))
+        self.assertEqual(ps.get_mesh_axes(), {"dp", "tp"})
+        self.assertEqual(ps[0], ("dp", "tp"))
 
     def test_partition_spec_iteration(self):
         """Partition spec should be iterable."""
-        ps = PartitionSpec('tp', 'dp', None)
+        ps = PartitionSpec("tp", "dp", None)
         axes = list(ps)
-        self.assertEqual(axes, ['tp', 'dp', None])
+        self.assertEqual(axes, ["tp", "dp", None])
 
     def test_partition_spec_repr(self):
         """Test string representation of PartitionSpec."""
         ps = PartitionSpec()
         self.assertEqual(repr(ps), "PartitionSpec()")
 
-        ps = PartitionSpec('tp', None)
+        ps = PartitionSpec("tp", None)
         self.assertEqual(repr(ps), "PartitionSpec('tp', None)")
 
-        ps = PartitionSpec(('dp', 'tp'), 'ep')
+        ps = PartitionSpec(("dp", "tp"), "ep")
         self.assertEqual(repr(ps), "PartitionSpec(('dp', 'tp'), 'ep')")
-
-    def test_all_none_is_replicated(self):
-        """Partition spec with all None is replicated."""
-        ps = PartitionSpec(None, None, None)
-        self.assertTrue(ps.is_replicated())
 
 
 class TestRedistribute(LocalTensorTestCase):
@@ -1066,7 +957,7 @@ class TestRedistribute(LocalTensorTestCase):
         """redistribute(V,R) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
-        result = redistribute(x, 'tp', src=V, dst=R, dim=0)
+        result = redistribute(x, "tp", src=V, dst=R, dim=0)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
@@ -1077,7 +968,7 @@ class TestRedistribute(LocalTensorTestCase):
         """redistribute(V,I) uses all_gather."""
         x = self.mode.rank_map(lambda r: torch.tensor(float(r)))
 
-        result = redistribute(x, 'tp', src=V, dst=I, dim=0)
+        result = redistribute(x, "tp", src=V, dst=I, dim=0)
 
         expected = torch.tensor([0.0, 1.0, 2.0])
         self._assert_all_ranks_equal(result)
@@ -1086,10 +977,10 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_p_to_r(self):
         """redistribute(P,R) uses all_reduce."""
-        x = self._generate_inputs((4,), 'partial')
+        x = self._generate_inputs((4,), "partial")
         expected_sum = sum(x._local_tensors[r].clone() for r in range(self.WORLD_SIZE))
 
-        result = redistribute(x, 'tp', src=P, dst=R)
+        result = redistribute(x, "tp", src=P, dst=R)
 
         self._assert_all_ranks_equal(result)
         for r in range(self.WORLD_SIZE):
@@ -1098,9 +989,11 @@ class TestRedistribute(LocalTensorTestCase):
     def test_redistribute_p_to_v(self):
         """redistribute(P,V) uses reduce_scatter."""
         chunk_size = 2
-        x = self.mode.rank_map(lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(self.WORLD_SIZE * chunk_size, dtype=torch.float) + r
+        )
 
-        result = redistribute(x, 'tp', src=P, dst=V, dim=0)
+        result = redistribute(x, "tp", src=P, dst=V, dim=0)
 
         for r in range(self.WORLD_SIZE):
             expected = torch.zeros(chunk_size)
@@ -1108,25 +1001,29 @@ class TestRedistribute(LocalTensorTestCase):
                 chunk_start = r * chunk_size
                 chunk_end = (r + 1) * chunk_size
                 expected += x._local_tensors[src_rank][chunk_start:chunk_end]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_redistribute_r_to_v_uses_convert(self):
         """redistribute(R,V) delegates to convert."""
         base = torch.arange(6, dtype=torch.float).reshape(self.WORLD_SIZE, 2)
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = redistribute(x, 'tp', src=R, dst=V, dim=0)
+        result = redistribute(x, "tp", src=R, dst=V, dim=0)
 
         for r in range(self.WORLD_SIZE):
             expected = base[r]
-            torch.testing.assert_close(result._local_tensors[r], expected, msg=f"rank {r}")
+            torch.testing.assert_close(
+                result._local_tensors[r], expected, msg=f"rank {r}"
+            )
 
     def test_redistribute_r_to_p_uses_convert(self):
         """redistribute(R,P) delegates to convert."""
         base = torch.tensor([1.0, 2.0, 3.0])
         x = self.mode.rank_map(lambda r: base.clone())
 
-        result = redistribute(x, 'tp', src=R, dst=P)
+        result = redistribute(x, "tp", src=R, dst=P)
 
         torch.testing.assert_close(result._local_tensors[0], base)
         for r in range(1, self.WORLD_SIZE):
@@ -1134,15 +1031,17 @@ class TestRedistribute(LocalTensorTestCase):
 
     def test_redistribute_same_type_noop(self):
         """redistribute with same src and dst is identity."""
-        x = self._generate_inputs((4,), 'replicate')
-        result = redistribute(x, 'tp', src=R, dst=R)
+        x = self._generate_inputs((4,), "replicate")
+        result = redistribute(x, "tp", src=R, dst=R)
         self.assertIs(result, x)
 
     def test_redistribute_shard_to_shard_uses_all_to_all(self):
         """redistribute(S(i),S(j)) with different dims uses all_to_all."""
-        x = self.mode.rank_map(lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10)
+        x = self.mode.rank_map(
+            lambda r: torch.arange(6, dtype=torch.float).reshape(3, 2) + r * 10
+        )
 
-        result = redistribute(x, 'tp', src=S(0), dst=S(1), dim=0)
+        result = redistribute(x, "tp", src=S(0), dst=S(1), dim=0)
 
         # Check shapes are correct
         for r in range(self.WORLD_SIZE):
@@ -1150,5 +1049,5 @@ class TestRedistribute(LocalTensorTestCase):
             self.assertEqual(result._local_tensors[r].shape[1], 6)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

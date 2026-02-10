@@ -9,21 +9,20 @@ This module provides:
 
 import torch
 import torch.distributed as dist
-
-from dte.types import (
+from sixlib.spmd_types.types import (
+    DeviceMeshAxis,
+    I,
+    Invariant,
+    LocalSpmdType,
+    P,
+    Partial,
     PerMeshAxisLocalSpmdType,
     PerMeshAxisSpmdType,
-    LocalSpmdType,
-    DeviceMeshAxis,
-    Replicate,
-    Invariant,
-    Varying,
-    Partial,
-    Shard,
     R,
-    I,
+    Replicate,
+    Shard,
     V,
-    P,
+    Varying,
 )
 
 # =============================================================================
@@ -75,15 +74,21 @@ def assert_spmd_types(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tenso
     return tensor
 
 
-def get_spmd_type(tensor: torch.Tensor, axis: DeviceMeshAxis) -> PerMeshAxisSpmdType | None:
+def get_spmd_type(
+    tensor: torch.Tensor, axis: DeviceMeshAxis
+) -> PerMeshAxisSpmdType | None:
     """Get the SPMD type for a specific mesh axis, or None if not tracked."""
     return get_spmd_types(tensor).get(axis)
 
 
-def with_spmd_type(tensor: torch.Tensor, axis: DeviceMeshAxis, typ: PerMeshAxisSpmdType) -> torch.Tensor:
+def with_spmd_type(
+    tensor: torch.Tensor, axis: DeviceMeshAxis, typ: PerMeshAxisSpmdType
+) -> torch.Tensor:
     """Return tensor with an updated SPMD type for the given axis."""
     if not isinstance(typ, (PerMeshAxisLocalSpmdType, Shard)):
-        raise TypeError(f"Invalid type '{typ}'. Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))")
+        raise TypeError(
+            f"Invalid type '{typ}'. Must be a PerMeshAxisSpmdType (R, I, V, P, or S(i))"
+        )
     new_types = get_spmd_types(tensor).copy()
     new_types[axis] = typ
     return set_spmd_types(tensor, new_types)
@@ -97,7 +102,7 @@ def with_spmd_type(tensor: torch.Tensor, axis: DeviceMeshAxis, typ: PerMeshAxisS
 def infer_output_type_for_axis(
     axis: DeviceMeshAxis,
     axis_types: list[PerMeshAxisSpmdType],
-    out_partial: bool = False
+    out_partial: bool = False,
 ) -> PerMeshAxisSpmdType:
     """
     Infer the output SPMD type for a single mesh axis given input types.
@@ -142,9 +147,7 @@ def infer_output_type_for_axis(
             )
         inferred_type = P
     else:
-        raise TypeError(
-            f"Incompatible types on axis '{axis}': {axis_types}"
-        )
+        raise TypeError(f"Incompatible types on axis '{axis}': {axis_types}")
 
     # Apply out_partial: reinterpret as P
     if out_partial:
@@ -167,7 +170,7 @@ def infer_output_type_for_axis(
 
 def infer_output_types(
     input_types_list: list[LocalSpmdType],
-    out_partial_axes: set[DeviceMeshAxis] | None = None
+    out_partial_axes: set[DeviceMeshAxis] | None = None,
 ) -> LocalSpmdType:
     """
     Infer output SPMD types from a list of input types.

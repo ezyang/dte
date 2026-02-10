@@ -1,0 +1,65 @@
+load("@fbsource//genai/ai_devx/tools/test:defs.bzl", "xlformers_conda_test")
+load("@fbsource//genai/ai_devx/tools/macros:conda_python_library.bzl", "conda_python_library")
+
+oncall("msl_six")
+
+conda_python_library(
+    name = "__init__",
+    srcs = ["__init__.py"],
+    deps = [
+        ":_collectives",
+        ":_local",
+        ":_mesh",
+        ":types",
+    ],
+)
+
+conda_python_library(
+    name = "_mesh",
+    srcs = ["_mesh.py"],
+    deps = [],
+)
+
+conda_python_library(
+    name = "_collectives",
+    srcs = ["_collectives.py"],
+    deps = [
+        ":_local",
+        ":_mesh",
+        ":types",
+    ],
+)
+
+conda_python_library(
+    name = "_local",
+    srcs = ["_local.py"],
+    deps = [
+        ":_mesh",
+        ":types",
+    ],
+)
+
+conda_python_library(
+    name = "_checker",
+    srcs = ["_checker.py"],
+    labels = ["autodeps2_generated"],
+    deps = [
+        ":types",
+    ],
+)
+
+conda_python_library(
+    name = "types",
+    srcs = ["types.py"],
+    labels = ["autodeps2_generated"],
+)
+
+xlformers_conda_test(
+    name = "api_test",
+    srcs = ["api_test.py"],
+    deps = [
+        ":__init__",
+        ":_collectives",
+        ":_local",
+    ],
+)
