@@ -1,9 +1,11 @@
+# Megatron Quick Start
+
 This quick start guide is to help developers working on Megatron-derived
 training frameworks quickly adapt their code to use `spmd_types`.  It will
 only cover local SPMD types.  For a more theoretical and complete discussion of
 the design, see `DESIGN.md`.
 
-# Why use this?
+## Why use this?
 
 Have you ever:
 
@@ -27,7 +29,7 @@ at all.  Annotate your module inputs and parameters with their SPMD types, and
 then run your code with type checking on to verify that you haven't made
 mistakes that would result in incorrect gradients.
 
-# Types
+## Types
 
 Every tensor has a local SPMD type.  You can set it with `assert_local_type`,
 and when typechecking is enabled using the `SpmdTypeMode()` context manager,
@@ -73,7 +75,7 @@ Invariant   Invariant
 Varying     Varying
 ```
 
-# Operators
+## Operators
 
 `spmd_types` provides its own versions of distributed collectives and local
 operations which interact with the types in a non-trivial way.  An easy way to
@@ -133,7 +135,7 @@ see a call to `reduce_from_tensor_model_parallel_region`, you know that your
 output tensor is invariant--and more importantly, you know that its gradient is
 invariant (not partial!)
 
-# Advice about Invariant vs Replicate
+## Advice about Invariant vs Replicate
 
 Although Megatron contains many functions for working with the Invariant type,
 it is actually not recommended: in general, you want to have Replicate instead
@@ -143,7 +145,7 @@ training codebase as-is, applying types accurately for what it does at the
 moment, before considering refactors that take advantage of the type checking
 to verify correctness.
 
-# Forwards/Backwards
+## Forwards/Backwards
 
 Here is a table that summarizes the forward-backward relationships between the
 operators in our API (abbreviating the function calls to only include src/dst
