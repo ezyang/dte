@@ -1,10 +1,15 @@
 """Distributed collective operations: all_reduce, all_gather, reduce_scatter, all_to_all, redistribute."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from sixlib.spmd_types import _dist
 from sixlib.spmd_types._local import convert, reinterpret
 from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
+    _canonicalize_shard,
     I,
     P,
     PerMeshAxisSpmdType,
@@ -12,8 +17,10 @@ from sixlib.spmd_types.types import (
     Shard,
     V,
 )
-from torch.distributed import ProcessGroup
 from torch.overrides import handle_torch_function, has_torch_function_unary
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 # =============================================================================
 # all_reduce: P -> R | I
@@ -59,14 +66,24 @@ class _AllReduce(torch.autograd.Function):
 
 def all_reduce(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType,
     inplace: bool = False,
 ):
-    """
-    Reduce shards along the mesh axis, so every rank has the full summed value.
+    """``all_reduce(x: Partial, mesh_axis, dst) -> Replicate | Invariant``
+
+    Reduce shards along the mesh axis, so that every rank has the full summed value.
+
+    ::
+
+        def all_reduce_spec(x: f32[*shape]) -> f32[*shape]:
+            return x  # Identity! The summation already occured on x's conversion to Partial
+
+        +Ax
+        +Ay  =>  Ax + Ay + Az
+        +Az
 
     Args:
         x: Input tensor with P type on the mesh axis
@@ -79,8 +96,20 @@ def all_reduce(
     Returns:
         Tensor with R or I type depending on dst
 
-    When dst=R, backward is all_reduce(R): P -> R
-    When dst=I, backward is reinterpret(I,R): I -> R (no-op)
+    **Backward cases:**
+
+    When ``dst=R``, aka ``all_reduce(R): P -> R``, the backwards is ``all_reduce(R): P -> R``::
+
+                          +Ax
+        Ax + Ay + Az  <=  +Ay
+                          +Az
+
+    When ``dst=I``, aka ``all_reduce(I): P -> I``, the backwards is ``reinterpret(I,R): I -> R``::
+
+        A  <=  A
+
+    It is common to want to ``all_reduce`` on varying data; just
+    ``reinterpret(V,P)`` the data as partial before calling ``all_reduce``.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -107,6 +136,7 @@ def all_reduce(
         return _AllReduce.apply(x, axis, dst, inplace)
     else:
         raise ValueError(f"all_reduce dst must be R or I, got {dst}")
+
 
 # =============================================================================
 # all_gather: V -> R | I
@@ -150,19 +180,41 @@ class _AllGather(torch.autograd.Function):
 
 def all_gather(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType,
 ):
-    """
-    Gather shards along the mesh axis, so every rank has the full copy of data.
+    """``all_gather(x: Varying, mesh_axis, src, dst) -> Replicate | Invariant``
 
-    ```
-    [A]
-    [B]  =>  [A, B, C]
-    [C]
-    ```
+    Gather shards along the mesh axis, so that every rank has the full copy of
+    the data.  PyTorch's ``all_gather`` can either concat or stack inputs
+    together.  When the source tensor is interpreted as a varying tensor, we
+    stack the inputs together, creating a new dimension of size mesh axis.  But
+    if the source tensor is a sharded tensor, we concat along the sharded
+    dimension.
+
+    ::
+
+        def all_gather_spec(xs, src):
+            # NB: dst only affects autograd
+            match src:
+                case V:
+                    '''
+                    A
+                    B  =>  [A, B, C]
+                    C
+                    '''
+                    return torch.stack(xs)
+
+                case S(i):
+                    '''
+                    When i == 0:
+                    [A0, A1]
+                    [B0, B1]  =>  [A0, A1, B0, B1, C0, C1]
+                    [C0, C1]
+                    '''
+                    return torch.concat(xs, i)
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
@@ -173,8 +225,32 @@ def all_gather(
     Returns:
         Tensor with R or I type depending on dst
 
-    When dst=R, backward is reduce_scatter: P -> V
-    When dst=I, backward is convert(I,V): I -> V
+    **Backward cases:**
+
+    ``all_gather(V,R): V -> R``, the backwards is ``reduce_scatter(V): P -> V``::
+
+        Ax + Ay + Az      +[Ax, Bx, Cx]
+        Bx + By + Bz  <=  +[Ay, By, Cy]
+        Cx + Cy + Cz      +[Az, Bz, Cz]
+
+    ``all_gather(V,I): V -> I``, the backwards is ``convert(I,V): I -> V``::
+
+        A
+        B  <=  [A, B, C]
+        C
+
+    ``all_gather(S(i),R): S(i) -> R``, the backwards is ``reduce_scatter(S(i)): P -> S(i)``::
+
+        When i == 0:
+        [A0x + A0y + A0z, A1x + A1y + A1z]      +[A0x, A1x, B0x, B1x, C0x, C1x]
+        [B0x + B0y + B0z, B1x + B1y + B1z]  <=  +[A0y, A1y, B0y, B1y, C0y, C1y]
+        [C0x + C0y + C0z, C1x + C1y + C1z]      +[A0z, A1z, B0z, B1z, C0z, C1z]
+
+    ``all_gather(S(i),I): S(i) -> I``, the backwards is ``convert(I,S(i)): I -> S(i)``::
+
+        [A0, A1]
+        [B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
+        [C0, C1]
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -185,6 +261,9 @@ def all_gather(
             src=src,
             dst=dst,
         )
+    # Canonicalize negative Shard dims
+    src = _canonicalize_shard(src, x.ndim)
+
     # Validate src is V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_gather src must be V or S(i), got {src}")
@@ -220,13 +299,21 @@ class _ReduceScatter(torch.autograd.Function):
             )
             return result.squeeze(0)
         else:
-            # x concatenated on dim 0: shape[0] == N * world_size
+            # reduce_scatter_tensor always scatters along dim 0, so we
+            # movedim before/after when scatter_dim != 0.
+            needs_permute = scatter_dim != 0
+            if needs_permute:
+                x = x.movedim(scatter_dim, 0).contiguous()
+
             output_shape = list(x.shape)
             output_shape[0] //= world_size
             result = x.new_empty(output_shape)
             _dist.dist.reduce_scatter_tensor(
                 result, x, op=_dist.dist.ReduceOp.SUM, group=pg
             )
+
+            if needs_permute:
+                result = result.movedim(0, scatter_dim)
             return result
 
     @staticmethod
@@ -238,20 +325,40 @@ class _ReduceScatter(torch.autograd.Function):
 
 def reduce_scatter(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType = V,
     scatter_dim: int = 0,
 ):
-    """
-    Reduce shards along the mesh axis, but only get one shard of the result.
+    """``reduce_scatter(x, mesh_axis, dst): Partial -> Varying``
 
-    ```
-    +[Ax, Bx, Cx]      [Ax + Ay + Az]
-    +[Ay, By, Cy]  =>  [Bx + By + Bz]
-    +[Az, Bz, Cz]      [Cx + Cy + Cz]
-    ```
+    Reduce shards along the mesh axis, but only get one shard of the result
+    (e.g., an inefficient implementation of reduce-scatter would be to
+    all-reduce and then drop the data you did not need.)  Like ``all_gather``,
+    ``dst`` can either be varying for stack semantics, or shard for concat
+    semantics.
+
+    ::
+
+        def reduce_scatter_spec(x: f32[mesh_axis_size, *shape], dst) -> List[f32[*shape]]:
+            # NB: The semantic summation already occured on x's conversion to Partial
+            match dst:
+                case V:
+                    '''
+                    +[Ax, Bx, Cx]      Ax + Ay + Az
+                    +[Ay, By, Cy]  =>  Bx + By + Bz
+                    +[Az, Bz, Cz]      Cx + Cy + Cz
+                    '''
+                    return x.unbind()
+                case S(i):
+                    '''
+                    When i == 0:
+                    +[A0x, A1x, B0x, B1x, C0x, C1x]      [A0x + A0y + A0z, A1x + A1y + A1z]
+                    +[A0y, A1y, B0y, B1y, C0y, C1y]  =>  [B0x + B0y + B0z, B1x + B1y + B1z]
+                    +[A0z, A1z, B0z, B1z, C0z, C1z]      [C0x + C0y + C0z, C1x + C1y + C1z]
+                    '''
+                    return x.chunk(mesh_axis_size, i)
 
     Args:
         x: Input tensor with P type on the mesh axis
@@ -263,7 +370,23 @@ def reduce_scatter(
     Returns:
         Tensor with V or S(i) type depending on dst
 
-    The backward is all_gather(R): V -> R
+    **Backward cases:**
+
+    ``reduce_scatter(V): P -> V``, the backwards is ``all_gather(V,R): V -> R``::
+
+                       A
+        [A, B, C]  <=  B
+                       C
+
+    ``reduce_scatter(S(i)): P -> S(i)``, the backwards is ``all_gather(S(i),R): S(i) -> R``::
+
+        When i == 0:
+                                      [A0, A1]
+        [A0, A1, B0, B1, C0, C1]  <=  [B0, B1]
+                                      [C0, C1]
+
+    It is common to want to reduce-scatter on varying data; just
+    ``reinterpret(V,P)`` the data as partial before calling ``reduce_scatter``.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -275,6 +398,9 @@ def reduce_scatter(
             dst=dst,
             scatter_dim=scatter_dim,
         )
+    # Canonicalize negative Shard dims
+    dst = _canonicalize_shard(dst, x.ndim)
+
     if src is not P:
         if src is V:
             x = reinterpret(x, axis, src=V, dst=P)
@@ -347,21 +473,46 @@ class _AllToAll(torch.autograd.Function):
 
 def all_to_all(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType = V,
     split_dim: int = 0,
     concat_dim: int = 0,
 ):
-    """
-    Transpose a local tensor axis with the mesh axis.
+    """``all_to_all(x, mesh_axis, src, dst): Varying -> Varying``
 
-    ```
-    [A0, A1, A2]      [A0, B0, C0]
-    [B0, B1, B2]  =>  [A1, B1, C1]
-    [C0, C1, C2]      [A2, B2, C2]
-    ```
+    An all-to-all transposes a mesh axis with a tensor axis.
+
+    ::
+
+        def all_to_all_spec(xs, src, dst):
+            match src, dst:
+                case V, V:
+                    x = torch.stack(xs)
+                    x = x.transpose(0, 1)
+                    return x.unbind()
+
+                case S(i), S(j):
+                    x = torch.concat(xs, i)
+                    return x.chunk(mesh_axis_size, j)
+
+    The varying and shard versions of ``all_to_all`` are pretty different (even
+    though under the hood they both have an all-to-all communication pattern),
+    so we describe them separately.
+
+    * ``all_to_all(V,V)`` transposes the logical mesh axis with the dim 0 local
+      tensor axis.
+
+    * ``all_to_all(S(i),S(j))`` intuitively unshards the tensor on dim i, and
+      then reshards it on dim j (but skips actually doing the all-gather).
+
+    ::
+
+        Diagram for all_to_all(V,V):
+        [A0, A1, A2]      [A0, B0, C0]
+        [B0, B1, B2]  =>  [A1, B1, C1]
+        [C0, C1, C2]      [A2, B2, C2]
 
     Args:
         x: Input tensor with V or S(i) type on the mesh axis
@@ -374,7 +525,19 @@ def all_to_all(
     Returns:
         Tensor with V or S(j) type depending on dst
 
-    The backward is also all_to_all: V -> V (with src/dst swapped)
+    **Backward cases:**
+
+    The forwards is ``V -> V``, the backwards is ``all_to_all: V -> V`` (with
+    src/dst and split_dim/concat_dim swapped).
+
+    ``all_to_all(V,V): V -> V``, the backwards is ``all_to_all(V,V): V -> V``::
+
+        [A0, A1, A2]      [A0, B0, C0]
+        [B0, B1, B2]  <=  [A1, B1, C1]
+        [C0, C1, C2]      [A2, B2, C2]
+
+    ``all_to_all(S(i),S(j)): S(i) -> S(j)``, the backwards is
+    ``all_to_all(S(j),S(i)): S(j) -> S(i)``.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -387,6 +550,10 @@ def all_to_all(
             split_dim=split_dim,
             concat_dim=concat_dim,
         )
+    # Canonicalize negative Shard dims
+    src = _canonicalize_shard(src, x.ndim)
+    dst = _canonicalize_shard(dst, x.ndim)
+
     # Validate src and dst are V or S(i)
     if not (src is V or isinstance(src, Shard)):
         raise ValueError(f"all_to_all src must be V or S(i), got {src}")
@@ -409,18 +576,31 @@ def all_to_all(
 
 def redistribute(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
     dim: int = 0,
 ):
-    """
-    Semantics-preserving conversion between local SPMD types, allowing comms.
+    """Semantics-preserving type change that allows comms.
 
-    Unlike convert (which is no-comm), redistribute will perform the necessary
-    collective communication to change from one type to another while preserving
-    the semantic value of the tensor.
+    It is helpful to have a version of ``convert`` that is semantics preserving
+    but allows for comms.  ``redistribute`` routes to the following
+    collectives::
+
+        redistribute(S(i),R)    =   all_gather(S(i),R)
+        redistribute(S(i),I)    =   all_gather(S(i),I)
+        redistribute(P,R)       =   all_reduce(P,R)
+        redistribute(P,I)       =   all_reduce(P,I)
+        redistribute(P,S(i))    =   reduce_scatter(P,S(i))
+        redistribute(S(i),S(j)) =   all_to_all(S(i),S(j))
+
+    These only work if the mesh axis is the LAST to shard a particular tensor
+    dimension.
+
+    For conversions that don't require comms (R<->I, R->V, R->P, I->V, I->P,
+    V->P), this function delegates to ``convert`` or ``reinterpret`` as
+    appropriate.
 
     Args:
         x: Input tensor
@@ -429,21 +609,6 @@ def redistribute(
         dst: Target local SPMD type
         dim: Tensor dimension for shard operations (default: 0).
              When src or dst is S(i), the dim from S(i) is used.
-
-    Routes to:
-        redistribute(S(i),R)    -> all_gather(S(i),R)
-        redistribute(S(i),I)    -> all_gather(S(i),I)
-        redistribute(P,R)       -> all_reduce(P,R)
-        redistribute(P,I)       -> all_reduce(P,I)
-        redistribute(P,S(i))    -> reduce_scatter(P,S(i))
-        redistribute(S(i),S(j)) -> all_to_all(S(i),S(j))
-        redistribute(V,R)       -> all_gather(V,R)
-        redistribute(V,I)       -> all_gather(V,I)
-        redistribute(P,V)       -> reduce_scatter(P,V)
-        redistribute(V,V)       -> all_to_all(V,V)
-
-    For conversions that don't require comms (R<->I, R->V, R->P, I->V, I->P, V->P),
-    this function delegates to convert or reinterpret as appropriate.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -455,6 +620,10 @@ def redistribute(
             dst=dst,
             dim=dim,
         )
+    # Canonicalize negative Shard dims
+    src = _canonicalize_shard(src, x.ndim)
+    dst = _canonicalize_shard(dst, x.ndim)
+
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim

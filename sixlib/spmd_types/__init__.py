@@ -1,4 +1,5 @@
 # spmd_types package
+from __future__ import annotations
 
 # Collectives and operations
 from sixlib.spmd_types._checker import (

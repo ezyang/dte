@@ -135,6 +135,79 @@ see a call to `reduce_from_tensor_model_parallel_region`, you know that your
 output tensor is invariant--and more importantly, you know that its gradient is
 invariant (not partial!)
 
+## Propagation rules
+
+How do types propagate through your program on operators that are not the
+collectives listed above?  The rules are fairly simple:
+
+```
+op(Replicate..) -> Replicate
+op(Invariant..) -> Invariant  # NB: this case is uncommon
+op(Varying..) -> Varying
+linear_op(Partial) -> Partial
+
+# Invariant not allowed to mix with other types
+op(Replicate, Varying) -> Varying
+Partial + Partial -> Partial
+```
+
+To summarize:
+
+* You usually need to convert Invariant into Replicate before you
+  can do any compute with it (unless you are doing compute entirely with
+  Invariant)
+
+* Replicate and Varying can mix freely without requiring extra conversions;
+  if any input is Varying, the output is Varying
+
+* You can only propagate Partial through linear functions.
+
+## Generating Partial values
+
+The reduction collectives require the input to be Partial.  How can you
+generate a partial value?  If your tensor is varying, you can explicitly
+declare that a reduction is pending with
+`spmd.reinterpret(x, pg, src=spmd.V, dst=spmd.P)`.
+
+However, a better strategy that works better with global SPMD types is to
+explicitly annotate a local operation (e.g., a sum, a linear or an einsum)
+as producing a partial output.  For example, when you sum over a sharded
+dimension, in local SPMD semantics you would do a per-rank summation; in
+global SPMD semantics, you still need to do a summation across all the ranks.
+You can clearly specify that you meant to do the full summation (but are
+delaying it) with:
+
+```
+spmd.sum(x, pg, src=spmd.S(0), dst=spmd.P)
+```
+
+This function says that the input tensor is sharded on tensor dim 0 across pg,
+and so to do a *global* summation over this dimension, we will do the local
+summation and declare a pending summation over this pg as well.
+
+The following operations are supported by spmd:
+
+```
+spmd.sum(x, pg, src, dst)
+spmd.linear(x, w, pg, src, dst)
+spmd.einsum(equation, *args, pg, src, dst)
+```
+
+It is also supported to provide tuples for pg/src/dst, indicating that there
+are multiple mesh axes which are producing pending reductions, e.g.,
+
+```
+spmd.sum(x, (ax1, ax2), src=(spmd.S(0), spmd.S(1)), dst=(spmd.P, spmd.P))
+```
+
+TODO: These functions are not implemented yet
+
+TODO: spmd.P is very "explicit", there's probably a shorter form, is
+uniformity better?
+
+TODO: Is three tuples good, or you want to keep `ax1, src=spmd.S(0),
+dst=spmd.P` together?
+
 ## Advice about Invariant vs Replicate
 
 Although Megatron contains many functions for working with the Invariant type,
@@ -162,6 +235,7 @@ V -> R      all_gather(R)           P -> V      reduce_scatter()
 V -> V      all_to_all()            V -> V      all_to_all()
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
+V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 ----------------------------------------------------------------------------
 P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 V -> I      all_gather(I)           I -> V      convert(I,V)

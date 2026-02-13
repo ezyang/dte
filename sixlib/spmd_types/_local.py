@@ -1,9 +1,14 @@
 """Local SPMD type coercion operations: reinterpret and convert."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from sixlib.spmd_types import _dist
 from sixlib.spmd_types._mesh import _get_mesh_axis_group
 from sixlib.spmd_types.types import (
+    _canonicalize_shard,
     I,
     P,
     PerMeshAxisSpmdType,
@@ -11,9 +16,11 @@ from sixlib.spmd_types.types import (
     Shard,
     V,
 )
-from torch.distributed import ProcessGroup
 from torch.distributed._local_tensor import local_tensor_mode, LocalTensor
 from torch.overrides import handle_torch_function, has_torch_function_unary
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 # =============================================================================
 # reinterpret autograd Functions
@@ -104,16 +111,25 @@ class _ReplicateToPartial(torch.autograd.Function):
 
 def reinterpret(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
 ):
-    """
-    Coerce from one local SPMD type to another without changing the local tensor.
+    """``reinterpret(x, mesh_axis, src, dst)``
 
-    Guaranteed to be a no-op in forwards, but can have nontrivial backwards
-    that requires comms.
+    Coerce from one local SPMD type to another local SPMD type without changing
+    the local tensor.  It is guaranteed to be a no-op in forwards.
+
+    **Important:** Unlike ``convert``, ``reinterpret`` can change the semantic
+    value of a tensor.  For example, ``reinterpret(R,P)`` treats a replicated
+    value as if it were partial, meaning after reduction you get N times the
+    original value (where N is the mesh axis size).  If you want to preserve
+    semantics, use ``convert``.
+
+    This API does not support shard for src/dst, because the restriction on no
+    local tensor change means that the local SPMD semantics would be precisely
+    the same as the corresponding varying operation.
 
     Args:
         x: Input tensor
@@ -121,17 +137,100 @@ def reinterpret(
         src: Source local SPMD type (R, I, V, P)
         dst: Target local SPMD type (R, I, V, P)
 
-    Supported coercions:
-        - reinterpret(R,I): R -> I, backward is convert(I,P): I -> P
-        - reinterpret(R,V): R -> V, backward is reinterpret(V,P): V -> P
-        - reinterpret(R,P): R -> P, backward is reinterpret(R,P): R -> P
-        - reinterpret(I,R): I -> R, backward is all_reduce(I): P -> I
-        - reinterpret(I,V): I -> V, composition of I -> R -> V
-        - reinterpret(I,P): I -> P, composition of I -> R -> P
-        - reinterpret(V,P): V -> P, backward is reinterpret(R,V): R -> V
+    **Supported coercions:**
 
-    Note: This API does not support S(i) for src/dst, because the restriction
-    on no local tensor change means the semantics would be the same as V.
+    ``reinterpret(R,I): R -> I``, the backwards is ``convert(I,P): I -> P``::
+
+        def reinterpret_R_I_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+        A  =>  A
+
+        Backward:
+        +A
+        +0  <=  A
+        +0
+
+    ``reinterpret(R,V): R -> V``, the backwards is ``reinterpret(V,P): V -> P``::
+
+        def reinterpret_R_V_spec(x: f32[*shape]) -> List[f32[*shape]]:
+            # Makes N copies of the input
+            return [x] * mesh_axis_size
+
+        Forward:
+               A
+        A  =>  A
+               A
+
+        Backward:
+        +A      A
+        +B  <=  B
+        +C      C
+
+    ``reinterpret(I,R): I -> R``, the backwards is ``all_reduce(I): P -> I``::
+
+        def reinterpret_I_R_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+        A => A
+
+        Backward:
+                          +Ax
+        Ax + Ay + Az  <=  +Ay
+                          +Az
+
+    ``reinterpret(V,P): V -> P``, the backwards is ``reinterpret(R,V): R -> V``::
+
+        def reinterpret_V_P_spec(xs: List[f32[*shape]]) -> f32[*shape]:
+            # Semantically does a sum, even if physically it hasn't happened yet!
+            return sum(xs)
+
+        Forward:
+        A      +A
+        B  =>  +B
+        C      +C
+
+        Backward:
+        A
+        A  <=  A
+        A
+
+    ``reinterpret(R,P): R -> P``, the backwards is ``reinterpret(R,P): R -> P``::
+
+        def reinterpret_R_P(x: f32[*shape]) -> f32[*shape]:
+            # Summing each replicated entry together scales the value by axis size
+            return x * mesh_axis_size
+
+        Forward:
+               +A
+        A  =>  +A
+               +A
+
+        Backward:
+        +A
+        +A  <=  A
+        +A
+
+    ``reinterpret(I,V): I -> V`` is the composition of ``I -> R -> V``.
+    ``reinterpret(R,P): R -> P`` is the composition of ``R -> V -> P``.
+    ``reinterpret(I,P): I -> P`` is the composition of ``I -> R -> P``.  Note
+    that these reinterprets have unusual semantics: the resulting tensor has
+    been scaled by the mesh axis size (because you are now obligated to sum
+    each of the (equal) quantities of the rank together!)  If you instead
+    wanted to *preserve* the original semantic meaning of the tensor, use
+    ``convert``.
+
+    Here is a table of permissible reinterprets (``-`` is no-op, ``X`` is
+    direct coercion, ``/`` is transitive coercion.)::
+
+               dst
+               R I V P
+        src R  - X X /
+            I  X - / /
+            V      - X
+            P        -
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -192,7 +291,11 @@ def reinterpret(
 
 
 def _get_rank(pg):
-    """Get rank, using LocalTensorMode's simulated rank if available."""
+    """Get rank, using LocalTensorMode's simulated rank if available.
+
+    Args:
+        pg: The process group to query the rank from.
+    """
     mode = local_tensor_mode()
     if mode is not None:
         # We're in LocalTensorMode - rank will be set by tensor_map callback
@@ -202,7 +305,15 @@ def _get_rank(pg):
 
 
 def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
-    """Forward: split and take local portion based on rank."""
+    """Forward: split and take local portion based on rank.
+
+    Args:
+        x: The replicated input tensor.
+        world_size: Number of ranks in the process group.
+        split_dim: The tensor dimension to split along.
+        rank: The current rank's index.
+        stack: If True, use select (unbind semantics) instead of chunk (shard semantics).
+    """
     if stack:
         return x.select(split_dim, rank).contiguous()
     chunks = torch.chunk(x, world_size, dim=split_dim)
@@ -210,7 +321,15 @@ def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
 
 
 def _varying_to_partial_fwd(x, world_size, split_dim, rank, *, stack):
-    """Forward: pad with zeros, place data at rank position."""
+    """Forward: pad with zeros, place data at rank position.
+
+    Args:
+        x: The varying input tensor (local shard).
+        world_size: Number of ranks in the process group.
+        split_dim: The tensor dimension to embed the shard into.
+        rank: The current rank's index.
+        stack: If True, use stack semantics (insert new dim) instead of concat semantics.
+    """
     if stack:
         pad_shape = list(x.shape)
         pad_shape.insert(split_dim, world_size)
@@ -230,7 +349,12 @@ def _varying_to_partial_fwd(x, world_size, split_dim, rank, *, stack):
 
 
 def _replicate_to_partial_fwd(x, rank):
-    """Forward: keep value on rank 0, zero elsewhere."""
+    """Forward: keep value on rank 0, zero elsewhere.
+
+    Args:
+        x: The replicated input tensor.
+        rank: The current rank's index. Only rank 0 keeps its value.
+    """
     if rank == 0:
         return x.clone()
     else:
@@ -431,17 +555,32 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
 
 def convert(
     x,
-    axis: "str | ProcessGroup",
+    axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
     dim: int = 0,
 ):
-    """
-    Convert from one local SPMD type to another while preserving tensor semantics.
+    """``convert(x, mesh_axis, src, dst)``
 
-    Unlike reinterpret, convert may perform local tensor operations (but no comms).
-    When a tensor is varying, we interpret it as concatenation on the specified dim.
+    Convert from one local SPMD to another while preserving the semantics of
+    the tensor, without doing communications.  When src/dst is shard, this
+    means preserving the global SPMD semantics of the tensor per this sharding;
+    when src/dst is varying, this means preserving the local SPMD semantics (we
+    simply say that a non-varying tensor can be interpreted as varying by
+    unbinding dim 0, following the natural behavior of collectives like
+    all-gather and reduce-scatter that stack/unbind on dim 0).  The
+    shard/varying conversions are actually exactly identical, except for being
+    rank-preserving or not, so in the summary tables we will only include the
+    varying versions of operations.  However, we include both in the API
+    description for clarity.
+
+    You cannot convert out of P: the only way to eliminate the pending
+    reduction is to do the actual all-reduce.
+
+    For convenience, we also support ``convert(R,I)`` and ``convert(I,R)``,
+    which have the same meaning as ``reinterpret(R,I)`` and
+    ``reinterpret(I,R)``.
 
     Args:
         x: Input tensor
@@ -451,16 +590,181 @@ def convert(
         dim: The tensor dimension for split/concat operations (default: 0).
              When src or dst is S(i), the dim from S(i) is used instead.
 
-    Supported conversions:
-        - convert(R,V): R -> V, backward is convert(V,P): V -> P
-        - convert(R,S(i)): R -> S(i), backward is convert(S(i),P): S(i) -> P
-        - convert(I,V): I -> V, backward is all_gather(I): V -> I
-        - convert(I,S(i)): I -> S(i), backward is all_gather(S(i),I): S(i) -> I
-        - convert(R,P): R -> P, backward is convert(R,P): R -> P
-        - convert(I,P): I -> P, backward is reinterpret(R,I): R -> I
-        - convert(V,P): V -> P, backward is convert(R,V): R -> V
-        - convert(S(i),P): S(i) -> P, backward is convert(R,S(i)): R -> S(i)
-        - convert(R,I) and convert(I,R) are same as reinterpret
+    **Supported conversions:**
+
+    ``convert(R,V): R -> V``, the backward is ``convert(V,P): V -> P``
+
+    Input is replicated across ranks, so each rank holds the full tensor.  The
+    output keeps only the local shard along tensor dim 0, producing a varying
+    value.  This operation reduces the rank of the tensor.
+
+    ::
+
+        def convert_R_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
+            return x.unbind()
+
+        Forward:
+                       A
+        [A, B, C]  =>  B
+                       C
+
+        Backward:
+        +[A, 0, 0]      A
+        +[0, B, 0]  <=  B
+        +[0, 0, C]      C
+
+    ``convert(R,S(i)): R -> S(i)``, the backward is ``convert(S(i),P): S(i) -> P``
+
+    Like above, but the rank of the tensor is not reduced, and an arbitrary
+    tensor dim can be specified to be sharded.
+
+    ::
+
+        def convert_R_S_spec(x, i):
+            return x.chunk(mesh_axis_size, i)
+
+        Forward (for i = 0):
+                                      [A0, A1]
+        [A0, A1, B0, B1, C0, C1]  =>  [B0, B1]
+                                      [C0, C1]
+
+        Backward (for i = 0):
+        +[A0, A1, 0,  0,  0,  0 ]      [A0, A1]
+        +[0,  0,  B0, B1, 0,  0 ]  <=  [B0, B1]
+        +[0,  0,  0,  0,  C0, C1]      [C0, C1]
+
+    ``convert(I,V): I -> V``, the backwards is ``all_gather(V,I): V -> I``
+
+    Input is invariant across ranks, so each rank holds the full tensor.  The
+    output keeps only the local slice along dim 0, producing a varying value.
+    The rank of the tensor is reduced.
+
+    ::
+
+        def convert_I_V_spec(x: f32[mesh_axis_size, *shape]) -> List[f32[*shape]]:
+            return x.unbind()
+
+        Forward:
+                       A
+        [A, B, C]  =>  B
+                       C
+
+        Backward:
+                       A
+        [A, B, C]  <=  B
+                       C
+
+    ``convert(I,S(i)): I -> S(i)``, the backwards is ``all_gather(S(i),I): S(i) -> I``
+
+    Like above, but the rank of the tensor is not reduced, and an arbitrary
+    tensor dim can be specified to be sharded.
+
+    ::
+
+        def convert_I_S_spec(x, i):
+            return x.chunk(mesh_axis_size, i)
+
+        Forward (for i = 0):
+                                      [A0, A1]
+        [A0, A1, B0, B1, C0, C1]  =>  [B0, B1]
+                                      [C0, C1]
+
+        Backward (for i = 0):
+                                      [A0, A1]
+        [A0, A1, B0, B1, C0, C1]  <=  [B0, B1]
+                                      [C0, C1]
+
+    ``convert(R,P): R -> P``, the backwards is ``convert(R,P): R -> P``
+
+    Input is replicated across ranks.  The output keeps the same per-rank tensor
+    shape, but all ranks except the first are zeroed out, producing a partial
+    value that sums to the original tensor after a cross-rank reduction.
+
+    ::
+
+        def convert_R_P_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+                 +[A]
+        [A]  =>  +[0]
+                 +[0]
+
+        Backward:
+        +[A]
+        +[0]  <=  [A]
+        +[0]
+
+    ``convert(I,P): I -> P``, the backwards is ``reinterpret(R,I): R -> I``
+
+    Input is invariant across ranks.  The output keeps the same per-rank tensor
+    shape, but all ranks except the first are zeroed out, producing a partial
+    value that sums to the original tensor after a cross-rank reduction.
+
+    ::
+
+        def convert_I_P_spec(x: f32[*shape]) -> f32[*shape]:
+            return x
+
+        Forward:
+                 +[A]
+        [A]  =>  +[0]
+                 +[0]
+
+        Backward:
+        [A]  <=  [A]
+
+    ``convert(V,P): V -> P``, the backwards is ``convert(R,V): R -> V``
+
+    Input is varying, with each rank holding a shard or distinct value.  The
+    output places each rank's value into a disjoint position of a partial
+    tensor (zeros elsewhere) so that summing across ranks reconstructs the
+    stacked value.  The rank of the tensor is increased.
+
+    ::
+
+        def convert_V_P_spec(xs: List[f32[*shape]]) -> f32[mesh_axis_size, *shape]:
+            return torch.stack(xs)
+
+        Forward:
+        A      +[A, 0, 0]
+        B  =>  +[0, B, 0]
+        C      +[0, 0, C]
+
+        Backward:
+        A
+        B  <=  [A, B, C]
+        C
+
+    ``convert(S(i),P): S(i) -> P``, the backwards is ``convert(R,S(i)): R -> S(i)``
+
+    Like above, but the rank of the tensor is not reduced, and an arbitrary
+    tensor dim can be specified to be scattered on.
+
+    ::
+
+        def convert_S_P_spec(xs, i):
+            return torch.concat(xs, i)
+
+        Forward (for i = 0):
+        [A0, A1]      +[A0, A1, 0,  0,  0,  0 ]
+        [B0, B1]  =>  +[0,  0,  B0, B1, 0,  0 ]
+        [C0, C1]      +[0,  0,  0,  0,  C0, C1]
+
+        Backward (for i = 0):
+        [A0, A1]
+        [B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
+        [C0, C1]
+
+    Here is a table of permissible converts (``-`` is no-op, ``O`` is
+    supported, ``X`` is when the semantics is the same as reinterpret.)::
+
+               dst
+               R I V P
+        src R  - X O O
+            I  X - O O
+            V      - O
+            P        -
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -472,6 +776,10 @@ def convert(
             dst=dst,
             dim=dim,
         )
+    # Canonicalize negative Shard dims
+    src = _canonicalize_shard(src, x.ndim)
+    dst = _canonicalize_shard(dst, x.ndim)
+
     # Extract dim from Shard if present
     if isinstance(src, Shard):
         dim = src.dim

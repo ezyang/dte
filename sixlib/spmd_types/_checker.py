@@ -7,6 +7,9 @@ This module provides:
 - TorchFunctionMode for automatic type propagation
 """
 
+from __future__ import annotations
+
+from enum import auto, Enum
 from typing import Callable
 
 import torch
@@ -96,9 +99,9 @@ _FIX_CANDIDATES: list[tuple[type, PerMeshAxisLocalSpmdType, str, str]] = [
 
 def _suggest_fixes(
     axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
+    axis_types: list[PerMeshAxisLocalSpmdType],
     infer_fn: Callable[
-        [DeviceMeshAxis, list[PerMeshAxisSpmdType]], PerMeshAxisSpmdType
+        [DeviceMeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
     ],
 ) -> list[tuple[str, str, type]]:
     """Try each candidate fix and return suggestions for ones that work.
@@ -113,7 +116,14 @@ def _suggest_fixes(
     ``SpmdTypeError`` without calling ``_format_error_with_suggestions``.
     This makes recursion structurally impossible.
 
-    Returns list of (operation_str, consequence_str, from_type_class) tuples.
+    Args:
+        axis: The mesh axis where the type error occurred.
+        axis_types: The list of per-axis SPMD types that caused the error.
+        infer_fn: A raw inference function that takes (axis, axis_types) and
+            returns the inferred output type, or raises ``SpmdTypeError``.
+
+    Returns:
+        List of (operation_str, consequence_str, from_type_class) tuples.
     """
     # Compute the axis argument text once
     if isinstance(axis, str):
@@ -155,12 +165,19 @@ def _suggest_fixes(
 def _format_error_with_suggestions(
     base_msg: str,
     axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
+    axis_types: list[PerMeshAxisLocalSpmdType],
     infer_fn: Callable[
-        [DeviceMeshAxis, list[PerMeshAxisSpmdType]], PerMeshAxisSpmdType
+        [DeviceMeshAxis, list[PerMeshAxisLocalSpmdType]], PerMeshAxisLocalSpmdType
     ],
 ) -> str:
-    """Format an error message, appending fix suggestions if any exist."""
+    """Format an error message, appending fix suggestions if any exist.
+
+    Args:
+        base_msg: The base error message to display.
+        axis: The mesh axis where the type error occurred.
+        axis_types: The list of per-axis SPMD types that caused the error.
+        infer_fn: A raw inference function used to discover valid fixes.
+    """
     suggestions = _suggest_fixes(axis, axis_types, infer_fn)
     if not suggestions:
         return base_msg
@@ -177,44 +194,77 @@ def _format_error_with_suggestions(
 # =============================================================================
 
 # Attribute name for storing SPMD types on tensors
-_SPMD_TYPES_ATTR = "_spmd_types"
+_LOCAL_TYPE_ATTR = "_local_type"
 
 
-def _canonicalize(types: LocalSpmdType) -> LocalSpmdType:
-    """Canonicalize a LocalSpmdType by removing V entries.
+def _validate_and_canonicalize(types: LocalSpmdType) -> LocalSpmdType:
+    """Validate and canonicalize a LocalSpmdType.
 
-    Omitted mesh axes default to Varying, so explicit V entries are redundant.
-    Stripping them ensures that ``{"tp": R, "dp": V}`` and ``{"tp": R}``
-    compare as equal.
+    Validates that all values are valid local SPMD types (R, I, V, or P).
+    Shard types are not valid local SPMD types — they are used as arguments to
+    collective operations but must not be stored on tensors.
+
+    Canonicalizes by removing V entries: omitted mesh axes default to Varying,
+    so explicit V entries are redundant.  Stripping them ensures that
+    ``{"tp": R, "dp": V}`` and ``{"tp": R}`` compare as equal.
+
+    Args:
+        types: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types.
+
+    Raises:
+        TypeError: If any value is not a PerMeshAxisLocalSpmdType (R, I, V, or P).
     """
-    # return {axis: typ for axis, typ in types.items() if typ is not V}
-    return types  # FIXME: hack to unblock
+    for axis, typ in types.items():
+        if not isinstance(typ, PerMeshAxisLocalSpmdType):
+            if isinstance(typ, Shard):
+                raise TypeError(
+                    f"Shard type {typ!r} on axis {format_axis(axis)} cannot be stored "
+                    f"as a local SPMD type. Shard is only valid as src/dst in "
+                    f"collective operations. Use V instead for local type tracking."
+                )
+            raise TypeError(
+                f"Expected PerMeshAxisLocalSpmdType (R, I, V, or P) on axis "
+                f"{format_axis(axis)}, got {typ!r}"
+            )
+    return {axis: typ for axis, typ in types.items() if typ is not V}
 
 
 def has_local_type(tensor: torch.Tensor) -> bool:
-    """Return True if the tensor has SPMD type annotations."""
-    return hasattr(tensor, _SPMD_TYPES_ATTR)
+    """Return True if the tensor has SPMD type annotations.
+
+    Args:
+        tensor: The tensor to check for SPMD type annotations.
+    """
+    return hasattr(tensor, _LOCAL_TYPE_ATTR)
 
 
 def get_local_type(tensor: torch.Tensor) -> LocalSpmdType:
     """Get the SPMD types stored on a tensor.
 
+    Args:
+        tensor: The tensor to retrieve SPMD type annotations from.
+
     Raises:
         AttributeError: If the tensor has no SPMD type annotations.
             Use ``has_local_type`` to check first.
     """
-    try:
-        return getattr(tensor, _SPMD_TYPES_ATTR)
-    except AttributeError:
+    result = getattr(tensor, _LOCAL_TYPE_ATTR, None)
+    if result is None:
         raise AttributeError(
             "Tensor has no SPMD type annotations. "
             "Use has_local_type() to check, or assert_local_type() to annotate."
-        ) from None
+        )
+    return result
 
 
 def _set_local_type(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tensor:
-    """Set SPMD types on a tensor (internal). Returns the tensor for chaining."""
-    setattr(tensor, _SPMD_TYPES_ATTR, _canonicalize(types))
+    """Set SPMD types on a tensor (internal). Returns the tensor for chaining.
+
+    Args:
+        tensor: The tensor to annotate with SPMD types.
+        types: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types.
+    """
+    setattr(tensor, _LOCAL_TYPE_ATTR, _validate_and_canonicalize(types))
     return tensor
 
 
@@ -225,23 +275,21 @@ def assert_local_type(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tenso
     If the tensor has no SPMD types, sets them.
     If the tensor already has SPMD types, checks they equal the provided types.
 
-    Both the existing and provided types are canonicalized before comparison
-    (explicit V entries are stripped, since omitted axes default to V).
+    If a mesh axis is omitted from types, it is assumed that the tensor varies
+    over that mesh axis.
 
     Returns the tensor for chaining.
+
+    Args:
+        tensor: The tensor to assert or set SPMD types on.
+        types: A LocalSpmdType dict mapping mesh axes to per-axis SPMD types
+            (must be R, I, V, or P — not Shard).
 
     Raises:
         TypeError: If types contain invalid type objects (must be R/I/V/P)
         AssertionError: If existing types don't match provided types
     """
-    for axis_name, typ in types.items():
-        if not isinstance(typ, PerMeshAxisLocalSpmdType):
-            # passing Shard here is a common mistake, specifically test for it
-            raise TypeError(
-                f"assert_local_type requires PerMeshAxisLocalSpmdType (R, I, V, or P), "
-                f"got {typ!r} on axis {format_axis(axis_name)}"
-            )
-    canonical = _canonicalize(types)
+    canonical = _validate_and_canonicalize(types)
     if not has_local_type(tensor):
         return _set_local_type(tensor, canonical)
 
@@ -254,14 +302,26 @@ def assert_local_type(tensor: torch.Tensor, types: LocalSpmdType) -> torch.Tenso
     return tensor
 
 
-def get_axis_local_type(tensor: torch.Tensor, axis: DeviceMeshAxis) -> PerMeshAxisLocalSpmdType:
+def get_axis_local_type(
+    tensor: torch.Tensor, axis: DeviceMeshAxis
+) -> PerMeshAxisLocalSpmdType:
     """Get the SPMD type for a specific mesh axis.
 
-    Returns V (Varying) if the tensor has no annotations or the axis is not
-    explicitly stored, since omitted axes default to Varying.
+    Returns V (Varying) if the axis is not explicitly stored, since omitted
+    axes default to Varying.
+
+    Raises:
+        ValueError: If the tensor has no SPMD type annotations.
+
+    Args:
+        tensor: The tensor to query.
+        axis: The mesh axis to look up (string name or ProcessGroup).
     """
     if not has_local_type(tensor):
-        return V
+        raise ValueError(
+            "get_axis_local_type: tensor has no SPMD type annotations. "
+            "Use has_local_type() to check first, or assert_local_type() to annotate."
+        )
     return get_local_type(tensor).get(axis, V)
 
 
@@ -270,15 +330,38 @@ def get_axis_local_type(tensor: torch.Tensor, axis: DeviceMeshAxis) -> PerMeshAx
 # =============================================================================
 
 
-def _infer_output_type_for_axis_raw(
+class OpLinearity(Enum):
+    """Classifies how a torch op interacts with Partial (P) types.
+
+    - NONLINEAR: P cannot propagate (safe default for unclassified ops).
+    - LINEAR: Linear map on direct sum; all-P -> P.
+      Examples: addition, subtraction, concat, clone.
+    - MULTILINEAR: Linear in each factor separately; P in one factor with R
+      in others -> P, but P in multiple factors is forbidden.
+      Examples: multiplication, matmul, einsum.
+    """
+
+    NONLINEAR = auto()
+    LINEAR = auto()
+    MULTILINEAR = auto()
+
+
+def _infer_local_type_for_axis_raw(
     axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
+    axis_types: list[PerMeshAxisLocalSpmdType],
     out_partial: bool = False,
-) -> PerMeshAxisSpmdType:
+    linearity: OpLinearity = OpLinearity.NONLINEAR,
+) -> PerMeshAxisLocalSpmdType:
     """Raw inference logic — raises plain ``SpmdTypeError`` without suggestions.
 
-    The public wrapper ``infer_output_type_for_axis`` catches these errors and
+    The public wrapper ``infer_local_type_for_axis`` catches these errors and
     enriches them with fix suggestions.
+
+    Args:
+        axis: The mesh axis name (used for error messages).
+        axis_types: List of input SPMD types for this axis.
+        out_partial: If True, reinterpret the inferred result as Partial.
+        linearity: How the op interacts with Partial types.
     """
     if not axis_types:
         if out_partial:
@@ -286,30 +369,59 @@ def _infer_output_type_for_axis_raw(
         raise ValueError(f"No types provided for axis {format_axis(axis)}")
 
     # Check type compatibility and infer output type
-    type_classes = {type(t) for t in axis_types}
+    type_set = set(axis_types)
 
-    if len(type_classes) == 1:
-        # All same type
+    if len(type_set) == 1:
         inferred_type = axis_types[0]
-    elif type_classes == {Replicate, Varying}:
+        if inferred_type is P:
+            if linearity is OpLinearity.NONLINEAR:
+                raise SpmdTypeError(
+                    f"Partial type on axis {format_axis(axis)} cannot propagate through "
+                    f"non-linear ops. Use all_reduce or reduce_scatter first. "
+                    f"Found types: {axis_types}"
+                )
+            elif linearity is OpLinearity.MULTILINEAR:
+                p_count = sum(1 for t in axis_types if t is P)
+                if p_count > 1:
+                    raise SpmdTypeError(
+                        f"Partial in multiple factors of multilinear op on axis "
+                        f"{format_axis(axis)} is forbidden. "
+                        f"Found types: {axis_types}"
+                    )
+                # Single P → P (unary multilinear is fine)
+            # LINEAR: all-P → P, pass through
+    elif type_set == {R, V}:
         # Mixed replicate/varying -> varying
         inferred_type = V
-    elif Invariant in type_classes and len(type_classes) > 1:
+    elif I in type_set and len(type_set) > 1:
         raise SpmdTypeError(
             f"Invariant type on axis {format_axis(axis)} cannot mix with other types. "
             f"Found types: {axis_types}"
         )
-    elif Partial in type_classes:
-        # Partial can only appear alone (for linear ops) or with another partial
-        # TODO: If this op is linear, P should propagate (linear_op(P) -> P).
-        # Need a mechanism to declare/detect linear ops.
-        non_partial = type_classes - {Partial}
-        if non_partial:
+    elif P in type_set:
+        # P mixed with non-P types
+        if linearity is OpLinearity.MULTILINEAR:
+            p_count = sum(1 for t in axis_types if t is P)
+            non_p = type_set - {P}
+            if p_count > 1:
+                raise SpmdTypeError(
+                    f"Partial in multiple factors of multilinear op on axis "
+                    f"{format_axis(axis)} is forbidden. "
+                    f"Found types: {axis_types}"
+                )
+            if non_p == {R}:
+                inferred_type = P  # P in one factor, R in others → P
+            else:
+                raise SpmdTypeError(
+                    f"Partial type on axis {format_axis(axis)} can only multiply with "
+                    f"Replicate. Found types: {axis_types}"
+                )
+        else:
+            # NONLINEAR and LINEAR both reject P mixed with non-P
             raise SpmdTypeError(
                 f"Partial type on axis {format_axis(axis)} can only combine with partial. "
                 f"Found types: {axis_types}"
             )
-        inferred_type = P
     else:
         raise SpmdTypeError(
             f"Incompatible types on axis {format_axis(axis)}: {axis_types}"
@@ -317,10 +429,7 @@ def _infer_output_type_for_axis_raw(
 
     # Apply out_partial: reinterpret as P
     if out_partial:
-        if inferred_type is V or isinstance(inferred_type, Shard):
-            return P
-        elif inferred_type is P:
-            # Already partial
+        if inferred_type is V or inferred_type is P:
             return P
         elif inferred_type is R:
             raise SpmdTypeError(
@@ -332,17 +441,18 @@ def _infer_output_type_for_axis_raw(
         else:
             raise SpmdTypeError(
                 f"Cannot mark axis {format_axis(axis)} as partial with type {inferred_type}. "
-                f"out_partial_axes is only valid for V, S(i), or P types."
+                f"out_partial_axes is only valid for V or P types."
             )
 
     return inferred_type
 
 
-def infer_output_type_for_axis(
+def infer_local_type_for_axis(
     axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
+    axis_types: list[PerMeshAxisLocalSpmdType],
     out_partial: bool = False,
-) -> PerMeshAxisSpmdType:
+    linearity: OpLinearity = OpLinearity.NONLINEAR,
+) -> PerMeshAxisLocalSpmdType:
     """
     Infer the output SPMD type for a single mesh axis given input types.
 
@@ -350,6 +460,7 @@ def infer_output_type_for_axis(
         axis: The mesh axis name (for error messages)
         axis_types: List of input types for this axis
         out_partial: If True, reinterpret the result as Partial
+        linearity: How the op interacts with Partial types
 
     Returns:
         The inferred output type
@@ -358,14 +469,16 @@ def infer_output_type_for_axis(
         SpmdTypeError: If the input types are incompatible
     """
     try:
-        return _infer_output_type_for_axis_raw(axis, axis_types, out_partial)
+        return _infer_local_type_for_axis_raw(axis, axis_types, out_partial, linearity)
     except SpmdTypeError as e:
         raise SpmdTypeError(
             _format_error_with_suggestions(
                 str(e),
                 axis,
                 axis_types,
-                lambda a, t: _infer_output_type_for_axis_raw(a, t, out_partial),
+                lambda a, t: _infer_local_type_for_axis_raw(
+                    a, t, out_partial, linearity
+                ),
             )
         ) from None
 
@@ -373,6 +486,7 @@ def infer_output_type_for_axis(
 def infer_output_types(
     input_types_list: list[LocalSpmdType],
     out_partial_axes: set[DeviceMeshAxis] | None = None,
+    linearity: OpLinearity = OpLinearity.NONLINEAR,
 ) -> LocalSpmdType:
     """
     Infer output SPMD types from a list of input types.
@@ -381,7 +495,7 @@ def infer_output_types(
     - If all operands are R -> output is R
     - If all operands are I -> output is I
     - If all operands are V -> output is V
-    - If all operands are P -> output is P
+    - If all operands are P -> output is P (linear ops only)
     - Mixed R/V -> output is V
     - I cannot mix with other types
     - P cannot mix with non-P types
@@ -389,6 +503,7 @@ def infer_output_types(
     Args:
         input_types_list: List of LocalSpmdType dicts, one per operand
         out_partial_axes: Optional set of mesh axis names to mark as partial
+        linearity: How the op interacts with Partial types
 
     Returns:
         LocalSpmdType dict for the output
@@ -409,14 +524,8 @@ def infer_output_types(
         for types in input_types_list:
             axis_types.append(types.get(axis, V))
 
-        if not axis_types:
-            # Axis only in out_partial_axes, no tensor operands
-            if axis in out_partial_axes:
-                output_types[axis] = P
-            continue
-
-        output_types[axis] = infer_output_type_for_axis(
-            axis, axis_types, out_partial=axis in out_partial_axes
+        output_types[axis] = infer_local_type_for_axis(
+            axis, axis_types, out_partial=axis in out_partial_axes, linearity=linearity
         )
 
     return output_types
@@ -432,81 +541,20 @@ def infer_output_types(
 # (handle_torch_function does not forward defaults).
 # A value of ``None`` means the parameter is required (no default).
 
-_MUL_OPS: set[Callable] = {torch.mul, torch.multiply}
-
-
-def _infer_mul_output_type_for_axis_raw(
-    axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
-) -> PerMeshAxisSpmdType:
-    """Raw mul inference logic — raises plain ``SpmdTypeError`` without suggestions.
-
-    Mul is linear in each argument, so P * R -> P is valid, but P * P is not.
-    When no Partial is involved, delegates to the standard raw inference rule.
-    """
-    type_classes = {type(t) for t in axis_types}
-    if Partial not in type_classes:
-        return _infer_output_type_for_axis_raw(axis, axis_types)
-
-    # Partial is present
-    non_partial = type_classes - {Partial}
-    if not non_partial:
-        # All P: P * P is forbidden
-        # TODO: If this op is linear, P should propagate (linear_op(P) -> P).
-        # Need a mechanism to declare/detect linear ops.
-        raise SpmdTypeError(
-            f"Partial * Partial on axis {format_axis(axis)} is forbidden (not linear). "
-            f"Found types: {axis_types}"
-        )
-    if non_partial == {Replicate}:
-        # P * R -> P (scaling partial by replicate)
-        return P
-    # TODO: If this op is linear, P should propagate (linear_op(P) -> P).
-    # Need a mechanism to declare/detect linear ops.
-    raise SpmdTypeError(
-        f"Partial type on axis {format_axis(axis)} can only multiply with Replicate. "
-        f"Found types: {axis_types}"
-    )
-
-
-def _infer_mul_output_type_for_axis(
-    axis: DeviceMeshAxis,
-    axis_types: list[PerMeshAxisSpmdType],
-) -> PerMeshAxisSpmdType:
-    """Infer output type for a mul op on a single mesh axis.
-
-    Mul is linear in each argument, so P * R -> P is valid, but P * P is not.
-    When no Partial is involved, delegates to the standard inference rule.
-    """
-    try:
-        return _infer_mul_output_type_for_axis_raw(axis, axis_types)
-    except SpmdTypeError as e:
-        raise SpmdTypeError(
-            _format_error_with_suggestions(
-                str(e),
-                axis,
-                axis_types,
-                _infer_mul_output_type_for_axis_raw,
-            )
-        ) from None
-
-
-def _infer_mul_output_types(
-    input_types_list: list[LocalSpmdType],
-) -> LocalSpmdType:
-    """Infer output types for a mul op across all mesh axes."""
-    all_axes: set[DeviceMeshAxis] = set()
-    for types in input_types_list:
-        all_axes.update(types.keys())
-
-    output_types: LocalSpmdType = {}
-    for axis in all_axes:
-        axis_types = []
-        for types in input_types_list:
-            axis_types.append(types.get(axis, V))
-        if axis_types:
-            output_types[axis] = _infer_mul_output_type_for_axis(axis, axis_types)
-    return output_types
+_OP_LINEARITY: dict[Callable, OpLinearity] = {
+    # Linear (direct sum): all tensor args participate linearly together
+    torch.add: OpLinearity.LINEAR,
+    torch.sub: OpLinearity.LINEAR,
+    torch.subtract: OpLinearity.LINEAR,
+    torch.Tensor.clone: OpLinearity.LINEAR,
+    torch.cat: OpLinearity.LINEAR,
+    torch.stack: OpLinearity.LINEAR,
+    # Multilinear (product): linear in each tensor arg separately
+    torch.mul: OpLinearity.MULTILINEAR,
+    torch.multiply: OpLinearity.MULTILINEAR,
+    torch.matmul: OpLinearity.MULTILINEAR,
+    torch.einsum: OpLinearity.MULTILINEAR,
+}
 
 
 def _iter_tensor_args(args: tuple, kwargs: dict):
@@ -514,6 +562,10 @@ def _iter_tensor_args(args: tuple, kwargs: dict):
 
     Flattens one level of list/tuple in positional args (for ops like
     torch.cat/stack).
+
+    Args:
+        args: Positional arguments to the torch operation.
+        kwargs: Keyword arguments to the torch operation.
     """
     for arg in args:
         if isinstance(arg, torch.Tensor):
@@ -534,8 +586,12 @@ def _check_all_typed(args: tuple, kwargs: dict) -> None:
     ``_collect_tensor_types`` itself stays simple and unconditional.
 
     Uses ``has_local_type`` rather than truthiness of the types dict because
-    ``_canonicalize`` strips V entries — a tensor annotated as all-V stores
+    ``_validate_and_canonicalize`` strips V entries — a tensor annotated as all-V stores
     ``{}`` but should still count as typed.
+
+    Args:
+        args: Positional arguments to the torch operation.
+        kwargs: Keyword arguments to the torch operation.
     """
     has_typed = False
     has_untyped = False
@@ -557,6 +613,10 @@ def _collect_tensor_types(args: tuple, kwargs: dict) -> list[LocalSpmdType]:
     Walks args (flattening one level of list/tuple for ops like torch.cat/stack)
     and kwargs values.  Skips tensors without annotations; since omitted axes
     default to V, unannotated tensors contribute nothing to inference.
+
+    Args:
+        args: Positional arguments to the torch operation.
+        kwargs: Keyword arguments to the torch operation.
     """
     result: list[LocalSpmdType] = []
     for t in _iter_tensor_args(args, kwargs):
@@ -566,7 +626,12 @@ def _collect_tensor_types(args: tuple, kwargs: dict) -> list[LocalSpmdType]:
 
 
 def _set_result_types(result: object, output_types: LocalSpmdType) -> None:
-    """Set SPMD types on the result tensor(s)."""
+    """Set SPMD types on the result tensor(s).
+
+    Args:
+        result: The operation result — a single tensor, or a list/tuple of tensors.
+        output_types: The LocalSpmdType dict to set on each result tensor.
+    """
     if isinstance(result, torch.Tensor):
         _set_local_type(result, output_types)
     elif isinstance(result, (list, tuple)):
@@ -575,6 +640,9 @@ def _set_result_types(result: object, output_types: LocalSpmdType) -> None:
                 _set_local_type(item, output_types)
 
 
+# Every function in this registry must accept (x: Tensor, axis, *, src=..., dst=...)
+# as its leading arguments, since __torch_function__ recovers src/dst from
+# args[0], args[1], and kwargs.
 _SPMD_FUNCTION_DEFAULTS: dict[Callable, dict[str, PerMeshAxisSpmdType | None]] = {
     all_reduce: {"src": P, "dst": None},
     all_gather: {"src": V, "dst": None},
@@ -608,8 +676,9 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
 
     Args:
         strict: If True, raises ``SpmdTypeError`` when a regular torch op
-            mixes typed and untyped tensor operands.  Useful for catching
-            unannotated tensors early during development.
+            mixes typed and untyped tensor operands.  Once all tensors are
+            annotated, keep this on to prevent unannotated tensors from
+            silently slipping through.
     """
 
     def __init__(self, strict: bool = False):
@@ -622,7 +691,13 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         # Run the function first (catches runtime errors before type errors)
         result = func(*args, **kwargs)
 
+        # Strict mode: all tensor operands must be annotated (applies to both
+        # SPMD collectives and regular torch ops).
+        if self.strict:
+            _check_all_typed(args, kwargs)
+
         if func in _SPMD_FUNCTION_DEFAULTS:
+            # Special spmd collective/reinterpret/collect
             x = args[0]
             if has_local_type(x):
                 defaults = _SPMD_FUNCTION_DEFAULTS[func]
@@ -653,14 +728,10 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
                 _set_local_type(result, output_types)
         else:
             # Regular torch op: propagate types according to non-comms rules
-            if self.strict:
-                _check_all_typed(args, kwargs)
             input_types_list = _collect_tensor_types(args, kwargs)
             if input_types_list:
-                if func in _MUL_OPS:
-                    output_types = _infer_mul_output_types(input_types_list)
-                else:
-                    output_types = infer_output_types(input_types_list)
+                linearity = _OP_LINEARITY.get(func, OpLinearity.NONLINEAR)
+                output_types = infer_output_types(input_types_list, linearity=linearity)
                 _set_result_types(result, output_types)
 
         return result

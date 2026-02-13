@@ -5,13 +5,20 @@ Callers should ``import sixlib.spmd_types._dist as _dist`` and access
 ``from ... import dist`` as that captures a snapshot.
 """
 
+from __future__ import annotations
+
 import torch.distributed as _torch_dist
 
 dist = _torch_dist
 
 
 def set_dist(module) -> None:
-    """Replace the dist implementation (e.g., with comms_wrapper)."""
+    """Replace the dist implementation (e.g., with comms_wrapper).
+
+    Args:
+        module: A module providing the same interface as ``torch.distributed``.
+            Pass None to reset to the default ``torch.distributed``.
+    """
     global dist
     if module is None:
         module = _torch_dist
