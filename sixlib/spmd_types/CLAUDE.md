@@ -24,7 +24,11 @@ DO NOT USE THESE AGENTS FOR THIS PROJECT, IT IS ACTIVELY COUNTERPRODUCTIVE.
 | `_checker.py` | Type tracking on tensors, type inference rules |
 | `_dist.py` | Patchable `torch.distributed` reference (use `_dist.dist` instead of importing `torch.distributed` directly) |
 | `_collectives.py` | Collective operations |
-| `api_test.py` | Test suite using `LocalTensorMode` for single-process distributed testing |
+| `_local.py` | Local (no-comms) operations: `reinterpret`, `convert` |
+| `_mesh.py` | Mesh setup and management |
+| `_testing.py` | Test utilities (`fake_pg`, etc.) |
+| `_test_utils.py` | Additional test helpers |
+| `eval/` | Evaluation examples (e.g., sequence-parallel scaling) |
 
 ## Import rules
 
@@ -42,15 +46,32 @@ This allows llama4x (and other integrators) to swap the dist backend via `set_di
 If you need to consult a copy of PyTorch for source diving, there is one at
 fbsource/fbcode/caffe2
 
+## Unicode
+
+Do not use Unicode characters (arrows, em dashes, etc.) in code or documentation unless absolutely necessary. Use ASCII equivalents instead: `->` for arrows, `<-` for left arrows, `<->` for bidirectional arrows, `--` for em dashes, etc.
+
+## Linting
+
+Suppress FLAKE8 C901 (function too complex) warnings with `# noqa: C901` on the function definition line rather than refactoring, as complex functions are a common pattern in this codebase.
+
 ## Testing
 
 Assume you are ALREADY in a conda env, no need to activate.
 
 ```bash
-pytest -x -s sixlib/spmd_types/api_test.py
+# Run all spmd_types tests
+pytest -x -s sixlib/spmd_types/*_test.py sixlib/spmd_types/eval/*_test.py
+
+# Run individual test files
+pytest -x -s sixlib/spmd_types/types_test.py        # Type hierarchy (R, I, V, P, S), PartitionSpec, mesh setup
+pytest -x -s sixlib/spmd_types/checker_test.py       # Type inference, strict mode, error messages
+pytest -x -s sixlib/spmd_types/local_test.py         # Local (no-comms) operations: reinterpret, convert
+pytest -x -s sixlib/spmd_types/collectives_test.py   # Collective ops: all_reduce, all_gather, reduce_scatter, all_to_all
+pytest -x -s sixlib/spmd_types/api_test.py           # Cross-module integration: redistribute, negative dim sharding
+pytest -x -s sixlib/spmd_types/eval/sp_scaling_test.py  # Evaluation examples (e.g., sequence-parallel scaling)
 ```
 
-Tests use `LocalTensorMode` with a `FakeStore` to simulate multiple ranks in a single process — no GPU or distributed backend needed.
+Tests use `LocalTensorMode` with a `FakeStore` to simulate multiple ranks in a single process -- no GPU or distributed backend needed.
 
 ## Design Quick Reference
 
@@ -65,9 +86,9 @@ Condensed from `DESIGN.md`. Read the full doc for diagrams, proofs, and worked e
 
 | Type | Forward meaning | Gradient type | Intuition |
 |------|----------------|---------------|-----------|
-| **R** (Replicate) | Same data on all ranks | P | Intermediate values during computation |
-| **I** (Invariant) | Same data on all ranks | I | Parameters (gradient already all-reduced) |
-| **V** (Varying) | Different data per rank | V | Sharded activations/data |
+| **R** (Replicate) | Same data on all ranks | P | N independent uses, one per rank |
+| **I** (Invariant) | Same data on all ranks | I | One computation, replicated across ranks |
+| **V** (Varying) | Different data per rank (no assumed global tensor) | V | Sharded activations/data |
 | **P** (Partial) | Pending sum across ranks | R | Unreduced results (e.g., after sharded matmul) |
 
 R and I have identical forward values; they differ only in backward semantics.
@@ -87,7 +108,7 @@ P + P -> P            # addition only; P * P is FORBIDDEN
 
 I cannot mix with other types. P can only combine with P via addition (multilinear ops).
 
-### Comms operators — type signatures
+### Comms operators -- type signatures
 
 **all_gather**: `V -> R|I` or `S(i) -> R|I`
 **all_reduce**: `P -> R|I`
@@ -141,10 +162,19 @@ Both are no-comms, but:
 - **reinterpret**: local tensor unchanged, semantic value may change (e.g., `reinterpret(R,P)` scales value by mesh size)
 - **convert**: semantic value preserved, local tensor may change (e.g., `convert(R,P)` zeros non-rank-0 tensors)
 
+### expert_mode
+
+Some `reinterpret`/`convert` operations require `expert_mode=True` because they are rarely wanted in forward code (they exist primarily as backward passes for other operations):
+
+- **`reinterpret(R,I)`**, **`reinterpret(R,P)`**, **`convert(I,P)`**: Obviously unusual forward semantics
+- **`reinterpret(R,V)`**, **`convert(V,P)`** / **`convert(S(i),P)`**: Legitimate backwards, unlikely forwards
+
+`redistribute` and autograd backwards bypass this gate automatically.
+
 ### Global SPMD additions
 
 - **PartitionSpec**: tuple matching tensor rank; each entry lists mesh axes sharding that dim. E.g., `f32[8,16@tp]` means dim 1 sharded by "tp".
-- **Shard propagation**: per-operator rules (e.g., einsum: no contracted dim sharded, mesh axes consistent across operands).
-- **Explicit partial**: contracted sharded dims require `out_partial_axes='tp'` kwarg — partial is never implicit.
+- **Shard propagation**: per-operator rules (e.g., einsum: mesh axes consistent across operands; contracted dims must not be sharded unless `out_partial_axes` is specified).
+- **Explicit partial**: when a contracted dim is sharded (e.g., `blf,fd->bld` with `f@tp`), you must pass `out_partial_axes='tp'` -- partial is never implicit.
 - **redistribute(src_spec, dst_spec)**: plans multi-axis collective sequences with flattened communicators.
 - Only `S(i)` (not `V`) variants of comms have global SPMD shard propagation rules; use `local_map`/`shard_map` for `V` variants.

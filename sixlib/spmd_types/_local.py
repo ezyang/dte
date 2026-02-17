@@ -76,7 +76,7 @@ class _InvariantToReplicate(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_reduce(I): P -> I
-        from sixlib.spmd_types._collectives import all_reduce
+        from sixlib.spmd_types._collectives import all_reduce  # @manual
 
         return all_reduce(grad_out, ctx.axis, src=P, dst=I), None
 
@@ -109,12 +109,13 @@ class _ReplicateToPartial(torch.autograd.Function):
         return grad_out, None
 
 
-def reinterpret(
+def reinterpret(  # noqa: C901
     x,
     axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
+    expert_mode: bool = False,
 ):
     """``reinterpret(x, mesh_axis, src, dst)``
 
@@ -135,7 +136,7 @@ def reinterpret(
         x: Input tensor
         axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type (R, I, V, P)
-        dst: Target local SPMD type (R, I, V, P)
+        dst: Destination local SPMD type (R, I, V, P)
 
     **Supported coercions:**
 
@@ -240,6 +241,7 @@ def reinterpret(
             axis,
             src=src,
             dst=dst,
+            expert_mode=expert_mode,
         )
     # Validate no Shard types
     if isinstance(src, Shard) or isinstance(dst, Shard):
@@ -250,6 +252,28 @@ def reinterpret(
 
     if src is dst:
         return x  # no-op
+
+    # Gate expert-only coercions
+    if not expert_mode:
+        if src is R and dst is I:
+            raise ValueError(
+                "reinterpret(R, I) requires expert_mode=True. "
+                "This is rarely what you want in the forward pass; "
+                "it exists as a backward for convert(I, P)."
+            )
+        if src is R and dst is P:
+            raise ValueError(
+                "reinterpret(R, P) requires expert_mode=True. "
+                "This scales the semantic value by the mesh axis size, which is rarely "
+                "intentional. If you want to preserve semantics, use convert(R, P) instead."
+            )
+        if src is R and dst is V:
+            raise ValueError(
+                "reinterpret(R, V) requires expert_mode=True. "
+                "This makes N copies of the input, which is rarely what you want in the "
+                "forward pass. If you want to shard a replicated value, use convert(R, V) "
+                "or convert(R, S(i)) instead."
+            )
 
     if src is R and dst is V:
         return _ReplicateToVarying.apply(x, axis)
@@ -288,20 +312,6 @@ def reinterpret(
 # =============================================================================
 # convert helper functions
 # =============================================================================
-
-
-def _get_rank(pg):
-    """Get rank, using LocalTensorMode's simulated rank if available.
-
-    Args:
-        pg: The process group to query the rank from.
-    """
-    mode = local_tensor_mode()
-    if mode is not None:
-        # We're in LocalTensorMode - rank will be set by tensor_map callback
-        # This function shouldn't be called directly in that case
-        return _dist.dist.get_rank(pg)
-    return _dist.dist.get_rank(pg)
 
 
 def _replicate_to_varying_fwd(x, world_size, split_dim, rank, *, stack):
@@ -446,7 +456,7 @@ class _ConvertInvariantToVarying(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         # backward is all_gather(I): V -> I
-        from sixlib.spmd_types._collectives import all_gather
+        from sixlib.spmd_types._collectives import all_gather  # @manual
 
         src = V if ctx.stack else Shard(ctx.split_dim)
         return all_gather(grad_out, ctx.axis, src=src, dst=I), None, None, None
@@ -553,13 +563,13 @@ class _ConvertVaryingToPartial(torch.autograd.Function):
             )
 
 
-def convert(
+def convert(  # noqa: C901
     x,
     axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
-    dim: int = 0,
+    expert_mode: bool = False,
 ):
     """``convert(x, mesh_axis, src, dst)``
 
@@ -586,9 +596,9 @@ def convert(
         x: Input tensor
         axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type (R, I, V, P, or S(i))
-        dst: Target local SPMD type (R, I, V, P, or S(i))
-        dim: The tensor dimension for split/concat operations (default: 0).
-             When src or dst is S(i), the dim from S(i) is used instead.
+        dst: Destination local SPMD type (R, I, V, P, or S(i)).
+             When src or dst is S(i), the split/concat dimension is
+             derived from the shard index.  Plain V always uses dim 0.
 
     **Supported conversions:**
 
@@ -654,6 +664,11 @@ def convert(
         [A, B, C]  <=  B
                        C
 
+    A common use case: shard a parameter (I) across ranks for memory savings.
+    Each rank stores and computes on only its local slice; in backward, the
+    per-rank gradient shards are all-gathered to reconstruct the full invariant
+    gradient needed by the optimizer.
+
     ``convert(I,S(i)): I -> S(i)``, the backwards is ``all_gather(S(i),I): S(i) -> I``
 
     Like above, but the rank of the tensor is not reduced, and an arbitrary
@@ -694,6 +709,12 @@ def convert(
         +[A]
         +[0]  <=  [A]
         +[0]
+
+    This operation is its own backward (self-dual).  A common forward use
+    case: when a replicated scalar (e.g., a regularization term) needs to be
+    added to a partial loss without being counted N times.  Converting R -> P
+    puts the value on only one rank, so the subsequent all-reduce produces
+    the correct total.
 
     ``convert(I,P): I -> P``, the backwards is ``reinterpret(R,I): R -> I``
 
@@ -774,13 +795,14 @@ def convert(
             axis,
             src=src,
             dst=dst,
-            dim=dim,
+            expert_mode=expert_mode,
         )
     # Canonicalize negative Shard dims
     src = _canonicalize_shard(src, x.ndim)
     dst = _canonicalize_shard(dst, x.ndim)
 
-    # Extract dim from Shard if present
+    # Derive dim from Shard types (V always uses dim 0)
+    dim = 0
     if isinstance(src, Shard):
         dim = src.dim
     if isinstance(dst, Shard):
@@ -790,7 +812,27 @@ def convert(
     src_base = V if isinstance(src, Shard) else src
     dst_base = V if isinstance(dst, Shard) else dst
 
+    # Gate expert-only coercions
+    if not expert_mode:
+        if src_base is I and dst_base is P:
+            raise ValueError(
+                "convert(I, P) requires expert_mode=True. "
+                "This zeros out all non-rank-0 tensors, which is rarely what you want. "
+                "It exists as a backward for reinterpret(R, I)."
+            )
+        if src_base is V and dst_base is P:
+            raise ValueError(
+                f"convert({src}, P) requires expert_mode=True. "
+                f"This pads with zeros to create a partial tensor, which is rarely what you "
+                f"want in the forward pass. It exists as a backward for convert(R, {src})."
+            )
+
     if src_base is dst_base:
+        if isinstance(src, Shard) and isinstance(dst, Shard) and src.dim != dst.dim:
+            raise ValueError(
+                f"convert(S({src.dim}), S({dst.dim})) cannot change the shard dimension "
+                f"without communication. Use all_to_all() instead."
+            )
         return x  # no-op
 
     if src_base is R and dst_base is V:
@@ -830,3 +872,53 @@ def convert(
                 )
         else:
             raise ValueError(f"convert({src}, {dst}) is not supported.")
+
+
+def shard(
+    x,
+    axis: str | ProcessGroup,
+    *,
+    src: PerMeshAxisSpmdType,
+    dst: PerMeshAxisSpmdType,
+):
+    """Convenience alias: ``shard(src, S(i))`` is ``convert(src, S(i))``.
+
+    Shards a replicated or invariant tensor along a given dimension without
+    communication.
+
+    Args:
+        x: Input tensor
+        axis: The mesh axis to operate on (string name or ProcessGroup)
+        src: Source local SPMD type (R or I)
+        dst: Destination shard type, must be S(i)
+    """
+    if not isinstance(dst, Shard):
+        raise ValueError(f"shard dst must be S(i), got {dst}")
+    return convert(x, axis, src=src, dst=dst)
+
+
+def invariant_to_replicate(
+    x,
+    axis: str | ProcessGroup,
+):
+    """Convenience alias: ``invariant_to_replicate`` is ``reinterpret(I, R)``.
+
+    Reinterprets an invariant tensor as replicated.  The local tensor is
+    unchanged; the only effect is that the backward will perform an
+    all-reduce (P -> I) instead of expecting invariant gradients.
+
+    Two common use cases:
+
+    1. A replicated parameter (I@tp, e.g., norm weights) entering
+       computation where each rank may contribute a different gradient.
+       The backward all-reduce synchronizes the gradient for the optimizer.
+    2. Megatron ``CopyToModelParallelRegion`` (SP=False only): inter-block
+       activations are I@tp, and this op transitions them to R@tp at the
+       column-parallel linear entry.  With sequence parallelism (the common
+       case), this role is filled by ``all_gather(dst=R): V->R`` instead.
+
+    Args:
+        x: Input tensor with I type on the mesh axis
+        axis: The mesh axis to operate on (string name or ProcessGroup)
+    """
+    return reinterpret(x, axis, src=I, dst=R)

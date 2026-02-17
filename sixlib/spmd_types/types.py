@@ -10,127 +10,75 @@ This module provides:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, TypeAlias
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 # =============================================================================
-# Per-Mesh-Axis Local SPMD Type Hierarchy
+# Per-Mesh-Axis Local SPMD Type Enum
 # =============================================================================
 
 
-class PerMeshAxisLocalSpmdType:
+class PerMeshAxisLocalSpmdType(Enum):
     """
-    Base class for local SPMD types on a single mesh axis.
+    Per-mesh-axis local SPMD type as an enum.
 
     Describes how a tensor is distributed across ranks on one axis of the
     device mesh, as well as how the gradients are distributed. The four
-    concrete types are: Replicate (R), Invariant (I), Varying (V), Partial (P).
+    values are: R (Replicate), I (Invariant), V (Varying), P (Partial).
     """
+
+    R = "R"
+    I = "I"  # noqa: E741
+    V = "V"
+    P = "P"
+
+    def __repr__(self):
+        return self.value
 
     def backward_type(self) -> PerMeshAxisLocalSpmdType:
         """Return the type that gradients have in the backward pass."""
-        raise NotImplementedError
+        return _BACKWARD_TYPE[self]
 
 
-class Replicate(PerMeshAxisLocalSpmdType):
-    """
-    Replicate type - data is replicated across ranks.
-
-    The gradient of replicate is partial.
-    """
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "R"
-
-    def backward_type(self) -> PerMeshAxisLocalSpmdType:
-        return P
-
-
-class Invariant(PerMeshAxisLocalSpmdType):
-    """
-    Invariant type - data is replicated across ranks, gradient is also invariant.
-
-    Unlike replicate, the gradient is expected to already be synchronized.
-    """
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "I"
-
-    def backward_type(self) -> PerMeshAxisLocalSpmdType:
-        return I
-
-
-class Varying(PerMeshAxisLocalSpmdType):
-    """
-    Varying type - data differs across ranks.
-
-    The gradient of varying is also varying.
-    """
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "V"
-
-    def backward_type(self) -> PerMeshAxisLocalSpmdType:
-        return V
-
-
-class Partial(PerMeshAxisLocalSpmdType):
-    """
-    Partial type - pending sum across ranks.
-
-    The gradient of partial is replicate.
-    """
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "P"
-
-    def backward_type(self) -> PerMeshAxisLocalSpmdType:
-        return R
+_BACKWARD_TYPE = {
+    PerMeshAxisLocalSpmdType.R: PerMeshAxisLocalSpmdType.P,
+    PerMeshAxisLocalSpmdType.I: PerMeshAxisLocalSpmdType.I,
+    PerMeshAxisLocalSpmdType.V: PerMeshAxisLocalSpmdType.V,
+    PerMeshAxisLocalSpmdType.P: PerMeshAxisLocalSpmdType.R,
+}
 
 
 @dataclass(frozen=True)
 class Shard:
     """
-    A special version of Varying that specifies that the tensor is sharded on
-    a particular dimension.
+    A refinement of Varying that specifies the tensor is sharded on a particular
+    dimension.
+
+    While Varying (V) only says "each rank has different data" without
+    specifying how ranks relate to a global tensor, Shard(dim) additionally
+    says "the global tensor can be reconstructed by concatenating the local
+    tensors along dimension ``dim``."  This is analogous to DTensor's
+    ``Shard(dim)`` placement.
 
     This is not a true type (notice it doesn't inherit from PerMeshAxisLocalSpmdType)
     but it is accepted at any src/dst argument and, from a typing perspective,
-    is equivalent to Varying.  However, it does change the semantics of operations
-    by changing you from stack/unbind semantics to concat/split semantics,
-    where the concatenation occurs on the dimension specified by Shard.
-    Intuitively, if you have a tensor that is sharded on tensor dim i, and you
-    do an all-gather, you typically want to concatenate the result on dim i.
+    is equivalent to Varying.  However, it does change the semantics of collectives
+    by switching from stack/unbind semantics (V) to concat/split semantics (S):
+
+    - ``all_gather(src=V)``: stacks per-rank tensors on a new dim 0
+      (output gains a dimension).
+    - ``all_gather(src=S(i))``: concatenates per-rank tensors along dim ``i``
+      (output has the same number of dimensions as each input).
+    - ``reduce_scatter(dst=V)``: unbinds along dim 0 after reducing
+      (output loses a dimension).
+    - ``reduce_scatter(dst=S(i))``: splits along dim ``i`` after reducing
+      (output has the same number of dimensions, but dim ``i`` shrinks).
+
+    In practice, most users want concat/split (S) rather than stack/unbind (V),
+    because tensors are typically sharded along an existing dimension.
 
     In global SPMD types, a per-mesh-axis Shard can also be used to manipulate
     the PartitionSpec in a mesh-oriented way, although the PartitionSpec is still
@@ -146,12 +94,18 @@ class Shard:
         return self
 
 
-# Single character singletons for ease of pattern matching
-R = Replicate()
-I = Invariant()
-V = Varying()
-P = Partial()
+# Single character aliases for ease of pattern matching
+R = PerMeshAxisLocalSpmdType.R
+I = PerMeshAxisLocalSpmdType.I  # noqa: E741
+V = PerMeshAxisLocalSpmdType.V
+P = PerMeshAxisLocalSpmdType.P
 S = Shard  # S(i) creates a Shard with dim=i
+
+# Backward compatibility aliases
+Replicate = R
+Invariant = I
+Varying = V
+Partial = P
 
 # Type aliases
 PerMeshAxisSpmdType = PerMeshAxisLocalSpmdType | Shard
@@ -186,7 +140,6 @@ class PartitionSpec(tuple):
         if not self:
             return "PartitionSpec()"
         return f"PartitionSpec({pr})"
-
 
 
 GlobalSpmdType: TypeAlias = "tuple[LocalSpmdType, PartitionSpec]"

@@ -31,20 +31,27 @@ mistakes that would result in incorrect gradients.
 
 ## Types
 
-Every tensor has a local SPMD type.  You can set it with `assert_local_type`,
+Every tensor has a local SPMD type.  You can set it with `assert_type`,
 and when typechecking is enabled using the `SpmdTypeMode()` context manager,
 we will propagate them through PyTorch functions.
 
 ```
 import sixlib.spmd_types as spmd
+from sixlib.spmd_types import PartitionSpec
 
 t = torch.ones(20)
 print(spmd.has_local_type(t))  # False, no type specified yet
-spmd.assert_local_type(t, {'tp': spmd.I})
+spmd.assert_type(t, {'tp': spmd.I})
 print(spmd.get_local_type(t))  # {'tp': spmd.I}
 with spmd.SpmdTypeMode():
     print(spmd.get_local_type(t * 4))  # {'tp': spmd.I}
-spmd.assert_local_type(t, {'tp': spmd.R})  # Error, because type is inconsistent!
+spmd.assert_type(t, {'tp': spmd.R})  # Error, because type is inconsistent!
+```
+
+The full signature is:
+
+```
+spmd.assert_type(tensor, local_spmd_type, partition_spec=None)
 ```
 
 A local SPMD type is a dictionary from string mesh axes (or raw process groups, if
@@ -73,6 +80,51 @@ Replicate   Partial
 Partial     Replicate
 Invariant   Invariant
 Varying     Varying
+```
+
+## Partition Spec
+
+Varying mesh axes can be omitted from the `local_spmd_type` dictionary.  When
+you omit them, you can optionally provide a `partition_spec` to describe which
+tensor dimensions are sharded on which mesh axes, giving global SPMD semantics.
+
+A `PartitionSpec` is a tuple with one entry per tensor dimension.  Each entry
+is either `None` (not sharded on this axis), a mesh axis name string (sharded
+on that axis), or a tuple of mesh axis name strings (sharded on multiple axes).
+
+If a mesh axis is R, I, or P, you **must** specify it in `local_spmd_type`
+even if it could be inferred from `partition_spec`, because it would be
+ambiguous whether it is Replicate or Invariant.
+
+If a mesh axis is neither mentioned in `local_spmd_type` (as R/I/P) nor in
+`partition_spec`, it is assumed to be Varying **without** a global SPMD type
+(i.e., purely local SPMD -- the sharding may be irregular or otherwise not
+expressible via `PartitionSpec`).
+
+As a shortcut, you can use `S(i)` in the `local_spmd_type` dictionary to mean
+"this mesh axis shards tensor dimension i", which is equivalent to specifying
+a `partition_spec` entry.  However, we reject `S(i)` if the same tensor
+dimension is sharded by multiple mesh axes, since the sharding order would be
+ambiguous; use an explicit `PartitionSpec` in that case.
+
+Here are some examples with a device mesh of `('dp', 'tp')`:
+
+```
+from sixlib.spmd_types import PartitionSpec
+
+# input is [batch@dp, seq, hidden@tp]
+spmd.assert_type(x, {}, PartitionSpec('dp', None, 'tp'))
+# or, using the per-mesh S(i) sugar:
+spmd.assert_type(x, {'dp': spmd.S(0), 'tp': spmd.S(2)})
+
+# prior to colwise linear, input is [batch@dp, seq, in_feature]
+# tp axis is Invariant (not sharded), must be explicit
+spmd.assert_type(x, {'tp': spmd.I}, PartitionSpec('dp', None, None))
+
+# input, but dp is irregularly sharded (not expressible in global SPMD)
+spmd.assert_type(x, {}, PartitionSpec(None, None, 'tp'))
+# or, being explicit about dp being Varying without a global type:
+spmd.assert_type(x, {'dp': spmd.V}, PartitionSpec(None, None, 'tp'))
 ```
 
 ## Operators

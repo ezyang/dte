@@ -43,7 +43,9 @@ class _AllReduce(torch.autograd.Function):
         assert x.is_contiguous(), "all_reduce input must be contiguous"
         # TODO: check if world_size == 1 short-circuit is really necessary
         if _dist.dist.get_world_size(pg) == 1:
-            return x
+            if inplace:
+                return x
+            return x.clone()
         if inplace:
             _dist.dist.all_reduce(x, op=_dist.dist.ReduceOp.SUM, group=pg)
             ctx.mark_dirty(x)
@@ -72,7 +74,7 @@ def all_reduce(
     dst: PerMeshAxisSpmdType,
     inplace: bool = False,
 ):
-    """``all_reduce(x: Partial, mesh_axis, dst) -> Replicate | Invariant``
+    """``all_reduce(x: Partial | Varying, mesh_axis, dst) -> Replicate | Invariant``
 
     Reduce shards along the mesh axis, so that every rank has the full summed value.
 
@@ -86,10 +88,10 @@ def all_reduce(
         +Az
 
     Args:
-        x: Input tensor with P type on the mesh axis
+        x: Input tensor with P or V type on the mesh axis
         axis: The mesh axis to reduce over (string name or ProcessGroup)
-        src: Source type (must be P)
-        dst: Target type (R or I)
+        src: Source type (P or V; if V, automatically reinterpreted as P first)
+        dst: Destination type (R or I)
         inplace: If True, perform the all-reduce in-place on the input tensor
             using ``dist.all_reduce`` instead of allocating a new output tensor.
 
@@ -110,6 +112,28 @@ def all_reduce(
 
     It is common to want to ``all_reduce`` on varying data; just
     ``reinterpret(V,P)`` the data as partial before calling ``all_reduce``.
+
+    **Why is** ``dst`` **required?** The backward pass differs materially:
+    ``all_reduce(R): P -> R`` has backward ``reduce_scatter: P -> V``, while
+    ``all_reduce(I): P -> I`` has backward ``reinterpret(I,R): I -> R``
+    (identity).  If a library always produced I and the caller later converted
+    ``I -> R``, the backward would miss the reduce-scatter optimization you'd
+    get from ``all_reduce(R)`` directly.  For library code that doesn't know
+    the caller's intent, accept ``dst`` as a parameter rather than hardcoding
+    a choice.
+
+    **When to choose R vs I:** If you intend to do *duplicated* work next
+    (same computation on every rank), use ``dst=I``.  If you intend to do
+    *different* work next (each rank uses the result differently), use
+    ``dst=R``.
+
+    **Example:** In Megatron-style TP without sequence parallelism,
+    ``ReduceFromModelParallelRegion`` (forward: all-reduce, backward:
+    identity) is ``all_reduce(dst=I)``.  The identity backward confirms
+    the choice of I--``all_reduce(dst=R)`` is self-dual and would require
+    an all-reduce in its backward too.  With sequence parallelism (the
+    common case), this role is filled by ``reduce_scatter(): P->V``
+    instead.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -174,7 +198,7 @@ class _AllGather(torch.autograd.Function):
             )
         else:
             # backward is convert(I,V): I -> V
-            grad = convert(grad_out, ctx.axis, src=I, dst=dst_type, dim=ctx.gather_dim)
+            grad = convert(grad_out, ctx.axis, src=I, dst=dst_type)
         return grad, None, None, None, None
 
 
@@ -220,7 +244,7 @@ def all_gather(
         x: Input tensor with V or S(i) type on the mesh axis
         axis: The mesh axis to gather over (string name or ProcessGroup)
         src: Source type (V or S(i)). When V, stacks on dim 0. When S(i), concatenates on dim i.
-        dst: Target type (R or I)
+        dst: Destination type (R or I)
 
     Returns:
         Tensor with R or I type depending on dst
@@ -251,6 +275,23 @@ def all_gather(
         [A0, A1]
         [B0, B1]  <=  [A0, A1, B0, B1, C0, C1]
         [C0, C1]
+
+    **When to choose R vs I:** If you intend to do *duplicated* work next
+    (same computation on every rank), use ``dst=I``.  If you intend to do
+    *different* work next (each rank uses the result differently), use
+    ``dst=R``.
+
+    **Example:** Megatron-style vocab-parallel cross-entropy computes
+    loss from TP-sharded logits.  At the type level, this decomposes as
+    ``all_gather(V, dst=I)`` (reconstruct full logits) followed by
+    ``CE(I, I) -> I`` (duplicated loss computation).  (The actual
+    implementation avoids materializing full logits by using scalar
+    all-reduces; the type decomposition describes the semantic contract,
+    not the communication pattern.)  The ``dst=I``
+    backward--``convert(I, V)``--matches the actual backward, which
+    computes each rank's logit-gradient partition locally with no
+    communication.  Using ``dst=R`` would incorrectly insert a
+    reduce-scatter.
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -329,7 +370,7 @@ def reduce_scatter(
     *,
     src: PerMeshAxisSpmdType = P,
     dst: PerMeshAxisSpmdType = V,
-    scatter_dim: int = 0,
+    scatter_dim: int | None = None,
 ):
     """``reduce_scatter(x, mesh_axis, dst): Partial -> Varying``
 
@@ -364,8 +405,10 @@ def reduce_scatter(
         x: Input tensor with P type on the mesh axis
         axis: The mesh axis to reduce-scatter over (string name or ProcessGroup)
         src: Source type (must be P)
-        dst: Target type (V or S(i))
-        scatter_dim: The tensor dimension to scatter along (default: 0)
+        dst: Destination type (V or S(i))
+        scatter_dim: The tensor dimension to scatter along. Defaults to 0 when
+            dst is V; inferred from the shard dim when dst is S(i). If both
+            scatter_dim and dst=S(i) are provided, they must agree.
 
     Returns:
         Tensor with V or S(i) type depending on dst
@@ -416,7 +459,15 @@ def reduce_scatter(
         raise ValueError(f"reduce_scatter dst must be V or S(i), got {dst}")
 
     if isinstance(dst, Shard):
+        if scatter_dim is not None and scatter_dim != dst.dim:
+            raise ValueError(
+                f"reduce_scatter got scatter_dim={scatter_dim} but dst=S({dst.dim}); "
+                f"these conflict. Either use dst=S({scatter_dim}) or remove scatter_dim."
+            )
         scatter_dim = dst.dim
+    else:
+        if scatter_dim is None:
+            scatter_dim = 0
 
     stack = dst is V
     return _ReduceScatter.apply(x, axis, scatter_dim, stack)
@@ -442,6 +493,13 @@ class _AllToAll(torch.autograd.Function):
         if stack:
             input_chunks = list(torch.unbind(x, dim=split_dim))
         else:
+            # TODO: support uneven splits by accepting explicit input/output
+            # sizes, like the underlying dist.all_to_all collective supports.
+            if x.shape[split_dim] % world_size != 0:
+                raise ValueError(
+                    f"all_to_all: tensor dimension {split_dim} (size {x.shape[split_dim]}) "
+                    f"is not evenly divisible by world_size ({world_size})"
+                )
             input_chunks = list(torch.chunk(x, world_size, dim=split_dim))
         output_chunks = [torch.empty_like(input_chunks[0]) for _ in range(world_size)]
         _dist.dist.all_to_all(output_chunks, input_chunks, group=pg)
@@ -477,8 +535,8 @@ def all_to_all(
     *,
     src: PerMeshAxisSpmdType = V,
     dst: PerMeshAxisSpmdType = V,
-    split_dim: int = 0,
-    concat_dim: int = 0,
+    split_dim: int | None = None,
+    concat_dim: int | None = None,
 ):
     """``all_to_all(x, mesh_axis, src, dst): Varying -> Varying``
 
@@ -518,9 +576,13 @@ def all_to_all(
         x: Input tensor with V or S(i) type on the mesh axis
         axis: The mesh axis to transpose with (string name or ProcessGroup)
         src: Source type (V or S(i))
-        dst: Target type (V or S(j))
-        split_dim: The tensor dimension to split along (default: 0)
-        concat_dim: The tensor dimension to concatenate along (default: 0)
+        dst: Destination type (V or S(j))
+        split_dim: The tensor dimension to split along. Defaults to 0 when
+            src is V; inferred from the shard dim when src is S(i). If both
+            split_dim and src=S(i) are provided, they must agree.
+        concat_dim: The tensor dimension to concatenate along. Defaults to 0
+            when dst is V; inferred from the shard dim when dst is S(j). If
+            both concat_dim and dst=S(j) are provided, they must agree.
 
     Returns:
         Tensor with V or S(j) type depending on dst
@@ -561,9 +623,25 @@ def all_to_all(
         raise ValueError(f"all_to_all dst must be V or S(i), got {dst}")
 
     if isinstance(src, Shard):
+        if split_dim is not None and split_dim != src.dim:
+            raise ValueError(
+                f"all_to_all got split_dim={split_dim} but src=S({src.dim}); "
+                f"these conflict. Either use src=S({split_dim}) or remove split_dim."
+            )
         split_dim = src.dim
+    else:
+        if split_dim is None:
+            split_dim = 0
     if isinstance(dst, Shard):
+        if concat_dim is not None and concat_dim != dst.dim:
+            raise ValueError(
+                f"all_to_all got concat_dim={concat_dim} but dst=S({dst.dim}); "
+                f"these conflict. Either use dst=S({concat_dim}) or remove concat_dim."
+            )
         concat_dim = dst.dim
+    else:
+        if concat_dim is None:
+            concat_dim = 0
 
     stack = src is V and dst is V
     return _AllToAll.apply(x, axis, split_dim, concat_dim, stack)
@@ -574,13 +652,12 @@ def all_to_all(
 # =============================================================================
 
 
-def redistribute(
+def redistribute(  # noqa: C901
     x,
     axis: str | ProcessGroup,
     *,
     src: PerMeshAxisSpmdType,
     dst: PerMeshAxisSpmdType,
-    dim: int = 0,
 ):
     """Semantics-preserving type change that allows comms.
 
@@ -606,9 +683,7 @@ def redistribute(
         x: Input tensor
         axis: The mesh axis to operate on (string name or ProcessGroup)
         src: Source local SPMD type
-        dst: Target local SPMD type
-        dim: Tensor dimension for shard operations (default: 0).
-             When src or dst is S(i), the dim from S(i) is used.
+        dst: Destination local SPMD type
     """
     if has_torch_function_unary(x):
         return handle_torch_function(
@@ -618,13 +693,13 @@ def redistribute(
             axis,
             src=src,
             dst=dst,
-            dim=dim,
         )
     # Canonicalize negative Shard dims
     src = _canonicalize_shard(src, x.ndim)
     dst = _canonicalize_shard(dst, x.ndim)
 
-    # Extract dim from Shard if present
+    # Derive dim from Shard types (V always uses dim 0)
+    dim = 0
     if isinstance(src, Shard):
         dim = src.dim
     if isinstance(dst, Shard):
@@ -667,18 +742,41 @@ def redistribute(
     # For non-comm conversions, delegate to convert
     # R -> I, I -> R, R -> V, R -> P, I -> V, I -> P, V -> P
     if src_base is R and dst_base is I:
-        return convert(x, axis, src=R, dst=I)
+        return convert(x, axis, src=R, dst=I, expert_mode=True)
     if src_base is I and dst_base is R:
-        return convert(x, axis, src=I, dst=R)
+        return convert(x, axis, src=I, dst=R, expert_mode=True)
     if src_base is R and dst_base is V:
-        return convert(x, axis, src=R, dst=dst, dim=dim)
+        return convert(x, axis, src=R, dst=dst, expert_mode=True)
     if src_base is R and dst_base is P:
-        return convert(x, axis, src=R, dst=P)
+        return convert(x, axis, src=R, dst=P, expert_mode=True)
     if src_base is I and dst_base is V:
-        return convert(x, axis, src=I, dst=dst, dim=dim)
+        return convert(x, axis, src=I, dst=dst, expert_mode=True)
     if src_base is I and dst_base is P:
-        return convert(x, axis, src=I, dst=P)
+        return convert(x, axis, src=I, dst=P, expert_mode=True)
     if src_base is V and dst_base is P:
-        return convert(x, axis, src=src, dst=P, dim=dim)
+        return convert(x, axis, src=src, dst=P, expert_mode=True)
 
     raise ValueError(f"redistribute({src}, {dst}) is not supported.")
+
+
+def unshard(
+    x,
+    axis: str | ProcessGroup,
+    *,
+    src: PerMeshAxisSpmdType,
+    dst: PerMeshAxisSpmdType,
+):
+    """Convenience alias: ``unshard(S(i), dst)`` is ``all_gather(S(i), dst)``.
+
+    Gathers a sharded tensor along the mesh axis so every rank has the full
+    copy.
+
+    Args:
+        x: Input tensor with S(i) type on the mesh axis
+        axis: The mesh axis to gather over (string name or ProcessGroup)
+        src: Source shard type, must be S(i)
+        dst: Destination type (R or I)
+    """
+    if not isinstance(src, Shard):
+        raise ValueError(f"unshard src must be S(i), got {src}")
+    return all_gather(x, axis, src=src, dst=dst)

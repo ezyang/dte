@@ -68,15 +68,40 @@ assume four distinct local SPMD types: replicate (R), invariant (I), varying
   the all-reduce, in case it can actually be a reduce-scatter.)  Notably,
   operations involving invariant tensors correspond directly to Megatron-style
   autograd functions like `CopyToModelParallelRegion`: when you
-  `reinterpret(I,R)` a parameter for use in computation, the backward pass
-  does an all-reduce (`all_reduce(I): P -> I`), giving you the synchronized
-  gradient you need for the optimizer step.
+  `reinterpret(I,R)` an invariant tensor for use in computation, the backward
+  pass does an all-reduce (`all_reduce(I): P -> I`), synchronizing the
+  gradient.  (This is the pattern used when sequence parallelism is off;
+  with sequence parallelism, the entry point is `all_gather(R): V->R`
+  instead--see "Loss gradient types" below for both cycles.)
+
+  An equivalent forward-oriented distinction: a tensor is invariant (I) when
+  there is logically one computation, replicated across ranks -- every rank
+  performs the same work, so the gradient is naturally identical everywhere.
+  A tensor is replicate (R) when there are N independent uses of the value,
+  one per rank -- each rank may contribute a different gradient, so gradients
+  must be aggregated.  When choosing R vs I as the destination of a
+  collective (all_gather or all_reduce), the rule of thumb is: use I if you
+  intend to do *duplicated* work next, use R if you intend to do *different*
+  work next.
 
 * Varying means that tensor has different values across the device mesh axis.
   The gradient of varying is varying.  We don't "know" how the tensor is
   supposed to be reassembled together, just that each rank has different data.
-  Semantically, we have is a list of tensors (one per rank), and operations are
-  done per-element.
+  Semantically, we have a list of tensors (one per rank), and operations are
+  done per-element.  (Contrast this with DTensor's `Shard(dim)` placement,
+  which specifies exactly how to reconstruct a global tensor by concatenating
+  along a given dimension.  The `S(i)` type in this system serves the same
+  role; see below.)
+
+  A concrete example: in sequence parallelism, the tokens are split across the
+  TP axis so each rank processes a different chunk of the sequence.  The
+  activation tensor is varying on that axis.  Varying also covers uneven splits
+  (e.g., an audio encoder that distributes tokens unevenly across TP ranks),
+  since it makes no assumptions about how the per-rank tensors relate to each
+  other.  In most cases you will want the more specific `S(i)` instead, which
+  additionally records which tensor dimension was split; plain V is the
+  fallback for situations where that information is unavailable or
+  inapplicable.
 
 * Partial means that there is a pending sum on the (differing) values
   across the device mesh axis, but it hasn't happened yet.  Delaying the reduction
@@ -247,13 +272,13 @@ local SPMD type passed into src/dst arguments.
 The detailed specification, diagrams, and backward cases for each operator are
 in the docstrings of the corresponding Python functions:
 
-* `all_gather` — see `_collectives.py::all_gather`
-* `all_reduce` — see `_collectives.py::all_reduce`
-* `reduce_scatter` — see `_collectives.py::reduce_scatter`
-* `all_to_all` — see `_collectives.py::all_to_all`
-* `reinterpret` — see `_local.py::reinterpret`
-* `convert` — see `_local.py::convert`
-* `redistribute` — see `_collectives.py::redistribute`
+* `all_gather` -- see `_collectives.py::all_gather`
+* `all_reduce` -- see `_collectives.py::all_reduce`
+* `reduce_scatter` -- see `_collectives.py::reduce_scatter`
+* `all_to_all` -- see `_collectives.py::all_to_all`
+* `reinterpret` -- see `_local.py::reinterpret`
+* `convert` -- see `_local.py::convert`
+* `redistribute` -- see `_collectives.py::redistribute`
 
 ## Comms by state transition
 
@@ -277,6 +302,32 @@ Varying         all_gather(R)       all_gather(I)       all_to_all()        rein
 
 Partial         all_reduce(R)       all_reduce(I)       reduce_scatter()    -
 ```
+
+**Intuition for the less obvious transitions:**
+
+* `reinterpret(I,R)`: Mark an invariant tensor as "entering computation" --
+  backward will all-reduce the gradient back to I.  Two common use cases:
+  (1) A replicated parameter (I@tp, e.g., norm weights) entering computation
+  where each rank may contribute a different gradient; the backward all-reduce
+  synchronizes the gradient for the optimizer.
+  (2) Megatron `CopyToModelParallelRegion` (SP=False only): inter-block
+  activations are I@tp, and this op transitions them to R@tp at the
+  column-parallel linear entry.  With sequence parallelism (the common case),
+  this role is filled by `all_gather(R): V->R` instead.
+* `all_gather(I): V -> I`: Reconstruct a full value from shards when every rank
+  will use it identically (e.g., gathering a parameter that was sharded for memory
+  savings).  Backward is `convert(I,V)`: each rank keeps only its gradient shard.
+* `all_reduce(I): P -> I`: Reduce partial results when every rank will do the same
+  computation on the result (e.g., computing loss after a TP all-reduce).
+  Backward is `reinterpret(I,R)`: identity, since the gradient is already invariant.
+* `convert(I,V): I -> V`: Shard an invariant value so each rank stores only its
+  slice (e.g., FSDP-style parameter sharding).  Backward is `all_gather(I)`.
+* `convert(R,P): R -> P`: Zeros non-rank-0 to create a partial representation.
+  Use case: adding a replicated regularization term to a partial loss without
+  double-counting.  Self-dual (its own backward).
+* `reinterpret(R,V): R -> V`: Declares N copies of a replicated value as varying.
+  Almost never wanted in forward (expert_mode gated); exists as the backward of
+  `reinterpret(V,P)`.  If you want to shard, use `convert(R,V)` instead.
 
 ## Comms by forwards-backwards
 
@@ -304,6 +355,104 @@ V -> P      reinterpret(V,P)        R -> V      reinterpret(R,V)
 P -> R      all_reduce(R)           P -> R      all_reduce(R)
 P -> I      all_reduce(I)           I -> R      reinterpret(I,R)
 P -> V      reduce_scatter()        V -> R      all_gather(R)
+
+## Loss gradient types
+
+The loss's type on each mesh axis depends on whether the axis partitions
+data or the model.
+
+**Data-partitioning axes (DP, CP): Partial.**  Each rank computes loss on
+its own data shard (a local, not global, loss).  The global loss is the sum
+across ranks, making each rank's loss value a partial contribution.
+
+**Model-partitioning axes (TP): Invariant.**  This can be verified by
+tracing SPMD types through a Megatron-style TP transformer.  The type
+cycle through a transformer block depends on whether sequence parallelism
+(SP) is enabled--SP is typically on in practice.
+
+**With SP=True** (common case), inter-block activations are V@tp on the
+sequence dimension:
+
+```
+V@tp(seq)  ->  all_gather(R)  ->  R@tp  ->  column matmul  ->  V@tp(hidden)
+     ^                                                              |
+     <-  reduce_scatter: P->V  <-  row matmul  <-  ... ops ...   <-
+```
+
+Here `GatherFromSequenceParallelRegion` is `all_gather(dst=R): V->R`
+(backward: reduce_scatter), and `ReduceScatterToSequenceParallelRegion`
+is `reduce_scatter(): P->V` (backward: all_gather(R)).
+
+**With SP=False**, inter-block activations are I@tp:
+
+```
+I@tp  ->  reinterpret(I,R)  ->  R@tp  ->  column matmul  ->  V@tp
+  ^                                                            |
+  <-  all_reduce(I): P->I  <-  row matmul  <-  ... ops ...  <-
+```
+
+Here `CopyToModelParallelRegion` (forward: identity, backward:
+all-reduce) is `reinterpret(I,R): I->R`, and
+`ReduceFromModelParallelRegion` (forward: all-reduce, backward:
+identity) is `all_reduce(dst=I): P->I`--not `all_reduce(dst=R)`, which
+is self-dual and would have an all-reduce in its backward too.
+
+In both cases, the interior of the cycle is identical: `R@tp -> column
+matmul -> V@tp(hidden) -> ... -> row matmul -> P@tp`.  Only the entry/exit
+operations and inter-block activation type differ (V@tp for SP, I@tp
+without SP).  R appears only transiently inside column-parallel linears,
+immediately becoming V.
+
+At the output layer (column-parallel), V@tp logits feed into
+vocab-parallel cross-entropy, which at the type level decomposes as
+`all_gather(V, dst=I)` fused with `CE(I,I)`, producing an I@tp loss.
+(The actual implementation avoids materializing full logits by using
+scalar all-reduces--the type decomposition describes the semantic
+contract, not the communication pattern.)
+
+So for a typical DP+TP+CP setup: `loss` is `P@dp, I@tp, P@cp`.
+`loss.backward()` starts with `grad = 1.0` inheriting these types, and
+the backward-type rules (R<->P, I<->I, V<->V) then determine gradient types
+throughout the backward pass.
+
+## Expert mode
+
+Some `reinterpret` and `convert` operations exist for completeness of the type
+system (and are needed as backward passes for other operations), but are rarely
+what a user wants to call directly in forward code.  To prevent accidental
+misuse, these operations require `expert_mode=True` to be passed explicitly.
+Without it, a `ValueError` is raised with an explanation of what the operation
+does and what you likely want instead.
+
+The gated operations fall into two categories:
+
+**Obviously unusual semantics** -- these change the semantic value of the tensor
+in ways that are almost never intentional in forward code:
+
+* `reinterpret(R, I)`: Treats a replicate tensor as invariant.  This is the
+  backward of `convert(I, P)` but has no natural forward use case, since
+  compute typically happens on R, not I.
+* `reinterpret(R, P)`: Treats a replicate value as partial, which scales its
+  semantic value by the mesh axis size.  If you want to preserve semantics,
+  use `convert(R, P)` instead.
+* `convert(I, P)`: Zeros out all non-rank-0 tensors to create a partial
+  representation of an invariant value.  This is the backward of
+  `reinterpret(R, I)`.
+
+**Legitimate backwards, unlikely forwards** -- these are used as backward passes
+for common operations, but are unlikely to be called directly in forward code:
+
+* `reinterpret(R, V)`: Makes N copies of the input (one per rank), which is
+  rarely intentional.  If you want to shard a replicated value, use
+  `convert(R, V)` or `convert(R, S(i))` instead.
+* `convert(V, P)` (and `convert(S(i), P)`): Pads with zeros to create a
+  partial tensor.  This is the backward of `convert(R, V)`.
+
+The `redistribute` function passes `expert_mode=True` internally when it
+delegates to `convert`, since redistribute is an intentional higher-level API
+where these transitions are expected.  Similarly, autograd backward functions
+call the underlying autograd Function classes directly and are not affected by
+the gate.
 
 # Global SPMD
 
@@ -371,7 +520,7 @@ map(f, in_spec(x)) == out_spec(f(x))
 A classic shard propagation rule is the one for `einsum`.  The following conditions
 must hold:
 
-1. No contracted dimension is sharded (but see the following discussion).
+1. No contracted dimension is sharded (but see below for the case when one is).
 2. For each mesh axis, if an output label is sharded on that mesh axis, then every
    operand either uses the label and is sharded on that axis, or doesn't use that
    label and is not sharded on that axis.
@@ -381,10 +530,14 @@ When these conditions succeed, at runtime we can simply run einsum as we would
 have run it in local SPMD, and know that there is an appropriate
 interpretation of the output where we computed the global SPMD semantics.
 When sharding propagation errors, it means that the global SPMD semantics and
-local SPMD semantics align, and comms are needed to ensure we actually compute
-global SPMD semantics.
+local SPMD semantics don't align, and comms are needed to ensure we actually
+compute global SPMD semantics.
 
-Let's talk about local operators that can produce partial.  When a contracted
+In practice, contracted dimensions often **are** sharded.  For example, in a
+row-parallel linear (`blf,fd->bld` with `f` sharded on TP), the contraction
+dimension `f` is sharded.  The local einsum on each rank computes only a
+partial result; to get the correct global answer, the partial results must be
+summed across ranks.  The question is how to express this.  When a contracted
 dimension is sharded, we can in principle do the operation entirely locally by
 declaring that there is a pending reduction.  This is PyTorch DTensor's
 behavior by default; it will transparently generate partial reductions from
