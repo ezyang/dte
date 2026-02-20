@@ -5,8 +5,6 @@ Provides FakeMesh and LocalTensorTestCase for simulating distributed operations
 in a single process using PyTorch's LocalTensorMode.
 """
 
-import unittest
-
 import torch
 import torch.distributed as dist
 from sixlib.spmd_types import set_mesh
@@ -16,6 +14,7 @@ from sixlib.spmd_types._checker import (
 )
 from sixlib.spmd_types.types import I, P, R, Shard, V
 from torch.distributed._local_tensor import LocalTensorMode
+from torch.testing._internal.common_utils import TestCase
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
@@ -39,7 +38,7 @@ class FakeMesh:
         return dist.distributed_c10d._get_default_group()
 
 
-class LocalTensorTestCase(unittest.TestCase):
+class LocalTensorTestCase(TestCase):
     """
     Base test class that sets up LocalTensorMode and fake process group.
     """
