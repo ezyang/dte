@@ -9,6 +9,8 @@ This module provides:
 
 from __future__ import annotations
 
+import functools
+import threading
 from dataclasses import dataclass
 from enum import auto, Enum
 from typing import Callable
@@ -37,6 +39,21 @@ from sixlib.spmd_types.types import (
     SpmdTypeError,
     V,
 )
+
+# =============================================================================
+# Global SPMD Mode Tracking
+# =============================================================================
+
+_tls = threading.local()
+
+
+def _is_global_mode() -> bool:
+    return getattr(_tls, "global_mode", False)
+
+
+def _set_global_mode(value: bool) -> None:
+    _tls.global_mode = value
+
 
 # =============================================================================
 # Fix Suggestion Engine
@@ -224,11 +241,13 @@ def _validate_and_canonicalize(type: LocalSpmdType) -> LocalSpmdType:
     for axis, typ in type.items():
         if not isinstance(typ, PerMeshAxisLocalSpmdType):
             if isinstance(typ, Shard):
-                raise TypeError(
-                    f"Shard type {typ!r} on axis {format_axis(axis)} cannot be stored "
-                    f"as a local SPMD type. Shard is only valid as src/dst in "
-                    f"collective operations. Use V instead for local type tracking."
-                )
+                if not _is_global_mode():
+                    raise TypeError(
+                        f"Shard type {typ!r} on axis {format_axis(axis)} cannot be stored "
+                        f"as a local SPMD type. Shard is only valid as src/dst in "
+                        f"collective operations. Use V instead for local type tracking."
+                    )
+                continue
             raise TypeError(
                 f"Expected PerMeshAxisLocalSpmdType (R, I, V, or P) on axis "
                 f"{format_axis(axis)}, got {typ!r}"
@@ -317,6 +336,18 @@ def assert_type(  # noqa: C901
             if a partition_spec axis conflicts with a non-Varying type in type
         AssertionError: If existing type doesn't match provided type
     """
+    # In global mode, S(i) is a first-class type stored directly on tensors.
+    if _is_global_mode():
+        canonical = _validate_and_canonicalize(type)
+        if not has_local_type(tensor):
+            return _set_local_type(tensor, canonical)
+        existing = get_local_type(tensor)
+        if existing != canonical:
+            raise AssertionError(
+                f"SPMD type mismatch: tensor has {existing}, expected {canonical}"
+            )
+        return tensor
+
     # Separate S(i) entries from R/I/V/P entries
     local_type: LocalSpmdType = {}
     shard_entries: dict[DeviceMeshAxis, Shard] = {}
@@ -1017,7 +1048,7 @@ def _collect_input_types(  # noqa: C901
 
 
 def _set_result_type(result: object, output_type: LocalSpmdType) -> None:
-    """Set SPMD types on the result tensor(s).
+    """Set the same SPMD type on all result tensor(s).
 
     Handles single tensors, flat list/tuple of tensors, and arbitrary nested
     structures (e.g., NamedTuples from ops like torch.linalg.lu_factor).
@@ -1047,6 +1078,23 @@ def _set_result_type(result: object, output_type: LocalSpmdType) -> None:
     for item in flat:
         if isinstance(item, torch.Tensor):
             _set_local_type(item, output_type)
+
+
+def _set_result_types(result: object, output_types: list[LocalSpmdType]) -> None:
+    """Set per-output SPMD types on a multi-output result.
+
+    Matches output_types positionally to tensors in the result structure
+    (tuple, list, or NamedTuple). DTensor's output spec is a flat Sequence
+    aligned with the op's output structure, so a simple zip suffices.
+
+    Args:
+        result: The multi-output result (tuple/list of tensors).
+        output_types: Per-output LocalSpmdType dicts, one per output position.
+    """
+    if isinstance(result, (list, tuple)):
+        for item, typ in zip(result, output_types):
+            if isinstance(item, torch.Tensor):
+                _set_local_type(item, typ)
 
 
 def _apply_fixed_args(  # noqa: C901
@@ -1140,6 +1188,338 @@ _SPMD_FUNCTION_DEFAULTS: dict[Callable, dict[str, PerMeshAxisSpmdType | None]] =
 
 
 # =============================================================================
+# Global SPMD Shard Propagation (via DTensor ShardingPropagator)
+# =============================================================================
+
+from torch.distributed.tensor.placement_types import (
+    Partial as _DTPartial,
+    Replicate as _DTReplicate,
+    Shard as _DTShard,
+)
+
+
+def _to_dt_placement(typ: PerMeshAxisSpmdType):
+    """Convert our per-axis SPMD type to a DTensor Placement."""
+    if isinstance(typ, Shard):
+        return _DTShard(typ.dim)
+    if typ is R:
+        return _DTReplicate()
+    if typ is P:
+        return _DTPartial()
+    raise ValueError(f"Cannot convert {typ} to DTensor placement")
+
+
+def _from_dt_placement(placement) -> PerMeshAxisSpmdType:
+    """Convert a DTensor Placement to our per-axis SPMD type."""
+    if isinstance(placement, _DTShard):
+        return Shard(placement.dim)
+    if isinstance(placement, _DTReplicate):
+        return R
+    if isinstance(placement, _DTPartial):
+        return P
+    raise ValueError(f"Cannot convert DTensor placement {placement}")
+
+
+# Dunder names that don't match their aten op name after stripping __.
+_DUNDER_NAME_OVERRIDES: dict[str, str] = {
+    "truediv": "true_divide",
+    "floordiv": "floor_divide",
+}
+
+# Preferred overload names, tried in order when resolving aten ops.
+_PREFERRED_OVERLOADS = ("default", "Tensor")
+
+# Cache: torch function -> (aten_op | None, reversed_args)
+_aten_op_cache: dict[Callable, tuple[torch._ops.OpOverload | None, bool]] = {}
+
+
+def _resolve_aten_op(
+    func: Callable,
+    propagator: object,
+) -> tuple[torch._ops.OpOverload | None, bool]:
+    """Resolve a torch function to its ATen op overload automatically.
+
+    Uses func.__name__ to derive the aten op name, handling dunder methods
+    and reflected operators. Picks the overload that DTensor's
+    ShardingPropagator has a strategy for.
+
+    Returns (aten_op, reversed_args) where reversed_args is True for
+    reflected operators like __rmatmul__.
+    """
+    cached = _aten_op_cache.get(func)
+    if cached is not None:
+        return cached
+
+    name = func.__name__
+    reversed_args = False
+
+    # Strip dunder wrappers: __add__ → add, __rmatmul__ → matmul
+    if name.startswith("__") and name.endswith("__"):
+        inner = name[2:-2]
+        # Detect reflected ops: __radd__ → radd, strip r → add
+        if inner.startswith("r") and hasattr(torch.ops.aten, inner[1:]):
+            reversed_args = True
+            inner = inner[1:]
+        # Detect in-place dunders: __iadd__ → add
+        elif inner.startswith("i") and hasattr(torch.ops.aten, inner[1:]):
+            inner = inner[1:]
+        name = _DUNDER_NAME_OVERRIDES.get(inner, inner)
+
+    packet = getattr(torch.ops.aten, name, None)
+    if packet is None:
+        _aten_op_cache[func] = (None, False)
+        return None, False
+
+    # Pick the overload that the propagator has a strategy for.
+    for overload_name in _PREFERRED_OVERLOADS:
+        op = getattr(packet, overload_name, None)
+        if op is None:
+            continue
+        if (
+            op in propagator.op_strategy_funcs
+            or op in propagator.op_single_dim_strategy_funcs
+            or op in propagator.op_to_rules
+        ):
+            _aten_op_cache[func] = (op, reversed_args)
+            return op, reversed_args
+
+    # No registered strategy found for any overload.
+    _aten_op_cache[func] = (None, False)
+    return None, False
+
+
+class _ShardPropagator:
+    """Lightweight per-axis shard propagator backed by DTensor's ShardingPropagator.
+
+    Lazily initializes on first use: imports DTensor ops (triggering strategy
+    registration) and creates a 1-D DeviceMesh for building OpSchemas.
+    """
+
+    def __init__(self):
+        self._propagator = None
+        self._mesh = None
+
+    def _ensure_init(self):
+        if self._propagator is not None:
+            return
+        import torch.distributed.tensor._ops  # noqa: F401  triggers registration
+        from torch.distributed.tensor import DTensor
+
+        self._propagator = DTensor._op_dispatcher.sharding_propagator
+
+    def _ensure_mesh(self):
+        if self._mesh is not None:
+            return
+        import torch.distributed as dist
+        from torch.distributed.device_mesh import DeviceMesh
+
+        self._mesh = DeviceMesh("cpu", torch.arange(dist.get_world_size()))
+
+    def propagate(
+        self,
+        func: Callable,
+        axis: DeviceMeshAxis,
+        axis_types: list[PerMeshAxisSpmdType],
+        args: tuple,
+    ) -> PerMeshAxisSpmdType | list[PerMeshAxisSpmdType]:
+        self._ensure_init()
+        aten_op, reversed_args = _resolve_aten_op(func, self._propagator)
+
+        if aten_op is not None:
+            try:
+                return self._propagate_via_dtensor(
+                    aten_op, axis, args, reversed_args
+                )
+            except SpmdTypeError:
+                raise
+            except Exception:
+                pass  # DTensor can't handle this op, fall through.
+
+        # Pointwise fallback: all S inputs must agree on dim.
+        shard_dims = {t.dim for t in axis_types if isinstance(t, Shard)}
+        if len(shard_dims) == 1:
+            return Shard(shard_dims.pop())
+        raise SpmdTypeError(
+            f"Conflicting shard dims on axis {format_axis(axis)}: "
+            f"{axis_types}"
+        )
+
+    def _propagate_via_dtensor(
+        self,
+        aten_op: torch._ops.OpOverload,
+        axis: DeviceMeshAxis,
+        args: tuple,
+        reversed_args: bool = False,
+    ) -> PerMeshAxisSpmdType | list[PerMeshAxisSpmdType]:
+        """Propagate shard types through DTensor's ShardingPropagator.
+
+        Uses pytree to walk args and replace typed tensors with DTensorSpecs,
+        preserving the arg structure (important for ops like cat/stack that
+        take a list of tensors).
+        """
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+        from torch.distributed.tensor._op_schema import OpSchema
+
+        self._ensure_mesh()
+        mesh = self._mesh
+
+        # For reversed dunder ops (__radd__ etc.), swap the first two args
+        # so the OpSchema matches the ATen op's argument order.
+        prop_args = args
+        if reversed_args and len(args) >= 2:
+            prop_args = (args[1], args[0]) + args[2:]
+
+        # Use pytree to build args_schema: replace typed tensors with
+        # DTensorSpecs, pass non-tensor args (int, float, etc.) through.
+        flat_args, tree_spec = torch.utils._pytree.tree_flatten(prop_args)
+        flat_schema = []
+        input_axis_types = []
+        for arg in flat_args:
+            if isinstance(arg, torch.Tensor) and has_local_type(arg):
+                typ = get_local_type(arg).get(axis, V)
+                input_axis_types.append(typ)
+                flat_schema.append(
+                    DTensorSpec(
+                        mesh=mesh,
+                        placements=(_to_dt_placement(typ),),
+                        tensor_meta=TensorMeta(
+                            shape=arg.shape,
+                            stride=arg.stride(),
+                            dtype=arg.dtype,
+                        ),
+                    )
+                )
+            else:
+                flat_schema.append(arg)
+        args_schema = torch.utils._pytree.tree_unflatten(flat_schema, tree_spec)
+
+        op_schema = OpSchema(
+            op=aten_op,
+            args_schema=tuple(args_schema),
+            kwargs_schema={},
+        )
+        output_sharding = self._propagator.propagate_op_sharding(op_schema)
+
+        if output_sharding.needs_redistribute:
+            raise SpmdTypeError(
+                f"No exact sharding strategy for {aten_op} "
+                f"with {input_axis_types} on axis {format_axis(axis)}"
+            )
+
+        output_spec = output_sharding.output_spec
+        if isinstance(output_spec, DTensorSpec):
+            return _from_dt_placement(output_spec.placements[0])
+        if isinstance(output_spec, (tuple, list)):
+            # Multi-output ops (e.g. split): one type per output tensor.
+            # None entries are non-tensor outputs, mapped to V.
+            return [
+                _from_dt_placement(spec.placements[0]) if spec is not None else V
+                for spec in output_spec
+            ]
+        raise SpmdTypeError(
+            f"DTensor propagator returned no output spec for {aten_op}"
+        )
+
+
+
+_shard_propagator = _ShardPropagator()
+
+
+def _propagate_shard_for_axis(
+    func: Callable,
+    axis: DeviceMeshAxis,
+    axis_types: list[PerMeshAxisSpmdType],
+    args: tuple,
+) -> PerMeshAxisSpmdType | list[PerMeshAxisSpmdType]:
+    """Propagate S(i) through an op for one mesh axis.
+
+    Returns a single type for single-output ops, or a list of types
+    for multi-output ops (one per output tensor).
+
+    Uses DTensor's ShardingPropagator when the ATen op mapping is known,
+    falling back to pointwise rules (all S inputs must agree on dim) otherwise.
+    """
+    return _shard_propagator.propagate(func, axis, axis_types, args)
+
+
+def _infer_global_output_type(
+    func: Callable,
+    spec: _OpSpec | None,
+    args: tuple,
+    input_types_list: list[LocalSpmdType],
+    shard_axes: set[DeviceMeshAxis],
+    all_axes: set[DeviceMeshAxis],
+) -> LocalSpmdType | list[LocalSpmdType]:
+    """Infer output type in global SPMD when shard axes are present.
+
+    Returns a single type dict for single-output ops, or a list of
+    type dicts for multi-output ops (one per output tensor).
+
+    Shard axes: validate constraints (no S+I, no S+P) then propagate via
+    DTensor. DTensor decides which S+R combinations are valid strategies
+    (e.g. mm(S(0), R) -> S(0)) and rejects the rest.
+    Non-shard axes: delegate to existing local SPMD inference.
+    """
+    # Propagate shard axes, collecting per-axis results.
+    # Each result is either a single type or a list (multi-output).
+    shard_results: dict[DeviceMeshAxis, PerMeshAxisSpmdType | list[PerMeshAxisSpmdType]] = {}
+    n_outputs = None
+    for axis in shard_axes:
+        axis_types = [typ.get(axis, V) for typ in input_types_list]
+        has_i = any(t is I for t in axis_types)
+        has_p = any(t is P for t in axis_types)
+        if has_i or has_p:
+            # S can't go through DTensor with I or P; decay S(i) to V
+            # and use local SPMD inference (which rejects with fix suggestions).
+            local_axis_types = [
+                V if isinstance(t, Shard) else t for t in axis_types
+            ]
+            linearity = spec.linearity if spec is not None else OpLinearity.NONLINEAR
+            result = infer_local_type_for_axis(
+                axis, local_axis_types, linearity=linearity
+            )
+        else:
+            result = _propagate_shard_for_axis(func, axis, axis_types, args)
+        shard_results[axis] = result
+        if isinstance(result, list):
+            n_outputs = len(result)
+
+    # Non-shard axes: single type shared across all outputs.
+    non_shard_output: LocalSpmdType = {}
+    non_shard_axes = all_axes - shard_axes
+    if non_shard_axes:
+        local_types = [
+            {a: t for a, t in typ.items() if a not in shard_axes}
+            for typ in input_types_list
+        ]
+        linearity = spec.linearity if spec is not None else OpLinearity.NONLINEAR
+        non_shard_output = infer_output_type(local_types, linearity=linearity)
+
+    if n_outputs is not None:
+        # Multi-output: build per-output type dicts.
+        output_types: list[LocalSpmdType] = [
+            dict(non_shard_output) for _ in range(n_outputs)
+        ]
+        for axis, result in shard_results.items():
+            if isinstance(result, list):
+                for i, rt in enumerate(result):
+                    if rt is not V:
+                        output_types[i][axis] = rt
+            else:
+                if result is not V:
+                    for ot in output_types:
+                        ot[axis] = result
+        return output_types
+
+    # Single output.
+    output_type: LocalSpmdType = dict(non_shard_output)
+    for axis, result in shard_results.items():
+        if result is not V:
+            output_type[axis] = result
+    return output_type
+
+
+# =============================================================================
 # TorchFunctionMode for SPMD Type Tracking
 # =============================================================================
 
@@ -1174,9 +1554,20 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
             silently slipping through.
     """
 
-    def __init__(self, strict: bool = True):
+    def __init__(self, strict: bool = True, global_mode: bool = False):
         super().__init__()
         self.strict = strict
+        self.global_mode = global_mode
+        self._prev_global_mode = False
+
+    def __enter__(self):
+        self._prev_global_mode = _is_global_mode()
+        _set_global_mode(self.global_mode)
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        _set_global_mode(self._prev_global_mode)
+        return super().__exit__(*args)
 
     def __torch_function__(self, func, types, args=(), kwargs=None):  # noqa: C901
         kwargs = kwargs or {}
@@ -1189,10 +1580,46 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
         if getattr(func, "__name__", None) == "__get__":
             return func(*args, **kwargs)
 
+        # In global mode, SPMD collectives are type-level only: skip the
+        # physical operation (which may change shapes) and just update types.
+        if _is_global_mode() and func in _SPMD_FUNCTION_DEFAULTS:
+            x = args[0]
+            if has_local_type(x):
+                if self.strict:
+                    _check_all_typed(args, kwargs)
+                defaults = _SPMD_FUNCTION_DEFAULTS[func]
+                axis = args[1] if len(args) > 1 else kwargs["axis"]
+                src = kwargs.get("src", defaults["src"])
+                dst = kwargs.get("dst", defaults["dst"])
+
+                input_type = get_local_type(x).get(axis, V)
+                if src is not None and input_type != src:
+                    raise SpmdTypeError(
+                        f"{func.__name__}: expected input type {src} on axis "
+                        f"{format_axis(axis)}, got {input_type}"
+                    )
+                output_type = get_local_type(x).copy()
+                if dst is not None:
+                    output_type[axis] = dst
+                result = x.clone()
+                setattr(result, _LOCAL_TYPE_ATTR, output_type)
+                return result
+
         # Run the function first (catches runtime errors before type errors).
         # This means collectives execute before type checking, but that's fine:
         # type checking typically runs with a fake PG where comms are free.
-        result = func(*args, **kwargs)
+        # In global mode, shape mismatches from type-level-only collectives
+        # are expected; fall back to cloning the first typed input.
+        if _is_global_mode():
+            try:
+                result = func(*args, **kwargs)
+            except RuntimeError:
+                first_input = next(_iter_tensor_args(args, kwargs), None)
+                if first_input is None:
+                    raise
+                result = first_input.clone()
+        else:
+            result = func(*args, **kwargs)
 
         # Strict mode: all tensor operands must be annotated (applies to both
         # SPMD collectives and regular torch ops).
@@ -1208,8 +1635,7 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
                 src = kwargs.get("src", defaults["src"])
                 dst = kwargs.get("dst", defaults["dst"])
 
-                # Decay Shard to Varying for local SPMD type checking.
-                # S(i) is a global SPMD refinement; locally it behaves as V.
+                # In local mode, decay Shard to Varying for type checking.
                 if isinstance(src, Shard):
                     src = V
                 if isinstance(dst, Shard):
@@ -1234,7 +1660,31 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
             spec = _OP_REGISTRY.get(func)
             input_types_list = _collect_input_types(args, kwargs, spec)
             if input_types_list:
-                # Check for type-level decomposition first.
+                # Global mode: check for shard axes requiring propagation.
+                if _is_global_mode():
+                    all_axes: set[DeviceMeshAxis] = set()
+                    for typ in input_types_list:
+                        all_axes.update(typ.keys())
+                    shard_axes = {
+                        axis
+                        for axis in all_axes
+                        if any(
+                            isinstance(typ.get(axis, V), Shard)
+                            for typ in input_types_list
+                        )
+                    }
+                    if shard_axes:
+                        output_type = _infer_global_output_type(
+                            func, spec, args, input_types_list,
+                            shard_axes, all_axes,
+                        )
+                        if isinstance(output_type, list):
+                            _set_result_types(result, output_type)
+                        else:
+                            _set_result_type(result, output_type)
+                        return result
+
+                # Local SPMD path (also used as fallback when no shard axes).
                 decomp_rule = _DECOMP_TYPE_RULES.get(func)
                 if decomp_rule is not None:
                     output_type = decomp_rule(*input_types_list)
@@ -1252,3 +1702,76 @@ class SpmdTypeMode(torch.overrides.TorchFunctionMode):
                 _set_result_type(result, output_type)
 
         return result
+
+
+# =============================================================================
+# Local/Global SPMD Transition
+# =============================================================================
+
+
+def local_map(
+    in_type: list[LocalSpmdType],
+    out_type: LocalSpmdType,
+):
+    """Decorator factory for local SPMD regions within global SPMD.
+
+    On entry: validates inputs match in_type, decays S(i) -> V.
+    Inside: runs in local SPMD mode (only R/I/V/P propagate).
+    On exit: re-annotates outputs with S(i) from out_type, restores inputs.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args):
+            # Validate inputs match in_type
+            for arg, expected_type in zip(args, in_type):
+                stored = get_local_type(arg)
+                for axis, typ in expected_type.items():
+                    actual = stored.get(axis, V)
+                    if actual != typ:
+                        raise SpmdTypeError(
+                            f"local_map: input has {actual} on axis "
+                            f"{format_axis(axis)}, expected {typ}"
+                        )
+
+            # Save input types, then decay S -> V
+            saved_types = []
+            for arg, expected_type in zip(args, in_type):
+                saved_types.append(get_local_type(arg).copy())
+                new_type = get_local_type(arg).copy()
+                for axis, typ in expected_type.items():
+                    if isinstance(typ, Shard):
+                        new_type.pop(axis, None)
+                setattr(arg, _LOCAL_TYPE_ATTR, new_type)
+
+            # Temporarily disable global mode
+            prev = _is_global_mode()
+            _set_global_mode(False)
+            try:
+                result = fn(*args)
+            finally:
+                _set_global_mode(prev)
+
+            # Re-annotate outputs with out_type
+            def apply_out_type(tensor):
+                current = get_local_type(tensor) if has_local_type(tensor) else {}
+                for axis, typ in out_type.items():
+                    current[axis] = typ
+                setattr(tensor, _LOCAL_TYPE_ATTR, current)
+
+            if isinstance(result, torch.Tensor):
+                apply_out_type(result)
+            elif isinstance(result, tuple):
+                for item in result:
+                    if isinstance(item, torch.Tensor):
+                        apply_out_type(item)
+
+            # Restore input types
+            for arg, saved in zip(args, saved_types):
+                setattr(arg, _LOCAL_TYPE_ATTR, saved)
+
+            return result
+
+        return wrapper
+
+    return decorator

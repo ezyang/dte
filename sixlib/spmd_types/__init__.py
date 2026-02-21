@@ -5,6 +5,7 @@ from __future__ import annotations
 from sixlib.spmd_types._checker import (  # noqa: F401
     assert_local_type,
     assert_type,
+    local_map,
     SpmdTypeMode,
 )
 from sixlib.spmd_types._collectives import (  # noqa: F401
